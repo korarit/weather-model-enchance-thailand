@@ -1,6 +1,6 @@
 # 📈 Phase 5: Hydrological Evaluation, Lead-Time Benchmark & RQ Validation
 
-> **สถานะ**: ร่างแผนงาน (Planning Phase - Strict No Code)  
+> **สถานะ**: ✅ ดำเนินการเสร็จสมบูรณ์ (Implemented & Validated)  
 > **เป้าหมายหลัก**: ประเมินประสิทธิภาพของระบบพยากรณ์ฝนหลังปรับแก้ (Bias-Corrected Forecasts) บน 2 km Grid เทียบกับสถานีตรวจวัดน้ำฝนภาคพื้นดินระดับ Golden & Silver Tiers (จาก Phase 1) ตลอดทั้งปี 2025 โดยวิเคราะห์ทั้งมิติความคลาดเคลื่อนต่อเนื่อง (Continuous Metrics), ความแม่นยำในการเตือนภัยฝนตกหนัก (Categorical Rain Thresholds), การเสื่อมถอยตามระยะเวลานำหน้า (Lead-Time Horizon) และสรุปคำตอบสำหรับคำถามวิจัย 5 ข้อ (RQ1–RQ5)  
 > **ข้อกำหนดพื้นที่ทำงาน**: โค้ดประเมินผล (`src/evaluation/`), ชุดข้อมูล Ground Truth (`data/clean_parquet/hourly_rain/`), และรายงานผลลัพธ์ (`outputs/`) ต้องอยู่ภายใต้ `weather-forcast-enhance/` ทั้งหมด ไม่มีการอ้างอิงไฟล์จากภายนอก
 
@@ -315,11 +315,11 @@ python src/evaluation/run_evaluation.py
 
 ## 7. สรุป Checklist ความพร้อม Phase 5
 
-- [ ] ออกแบบฟังก์ชันคำนวณและเปรียบเทียบ Continuous Metrics (RMSE, MAE, RMSE/MAE Ratio, Skill Scores $\text{SS}_{\text{RMSE}}, \text{SS}_{\text{MAE}}$)
-- [ ] ออกแบบฟังก์ชันคำนวณ Categorical Contingency Metrics (CSI, POD, FAR, F1 @ $\ge 0.1, 2, 10, 20$ mm/h)
-- [ ] กำหนดกระบวนการจับคู่ Spatial Verification ระหว่าง 2 km Grid กับ Ground Truth Stations ปี 2025
-- [ ] ออกแบบตารางแจกแจงการเปรียบเทียบ RMSE และ MAE ตาม Lead Time (+1h ถึง +24h)
-- [ ] ออกแบบชุดกราฟเส้นเปรียบเทียบรายเดือน (12-Month Line Charts Suite) ครอบคลุมทุกการเปรียบเทียบ (RMSE, MAE, Ratio, Skill Score, POD, FAR, Miss Rate, CSI, Ablation, Generalization Gap)
-- [ ] ออกแบบตารางสรุปผลรายเดือน (`monthly_rmse_mae_benchmark.csv`, `monthly_contingency_benchmark.csv`, `monthly_generalization_gap.csv`)
-- [ ] ออกแบบตารางและกราฟเปรียบเทียบ Generalization Gap (RMSE & MAE บน HII vs DWR Hold-Out)
-- [ ] จัดวางเทมเพลตสำหรับเขียนสรุปผลงานวิจัยเพื่อตอบครบทั้ง 5 RQs (RQ1–RQ5) พร้อมหลักฐานเชิงประจักษ์จาก RMSE และ MAE ตลอดทั้ง 12 เดือน
+- [x] ออกแบบฟังก์ชันคำนวณและเปรียบเทียบ Continuous Metrics (RMSE, MAE, RMSE/MAE Ratio, Skill Scores $\text{SS}_{\text{RMSE}}, \text{SS}_{\text{MAE}}$)
+- [x] ออกแบบฟังก์ชันคำนวณ Categorical Contingency Metrics (CSI, POD, FAR, F1 @ $\ge 0.1, 2, 10, 20$ mm/h)
+- [x] กำหนดกระบวนการจับคู่ Spatial Verification ระหว่าง 2 km Grid กับ Ground Truth Stations ปี 2025
+- [x] ออกแบบตารางแจกแจงการเปรียบเทียบ RMSE และ MAE ตาม Lead Time (+1h ถึง +24h)
+- [x] ออกแบบชุดกราฟเส้นเปรียบเทียบรายเดือน (12-Month Line Charts Suite) ครอบคลุมทุกการเปรียบเทียบ (RMSE, MAE, Ratio, Skill Score, POD, FAR, Miss Rate, CSI, Ablation, Generalization Gap)
+- [x] ออกแบบตารางสรุปผลรายเดือน (`monthly_rmse_mae_benchmark.csv`, `monthly_contingency_benchmark.csv`, `monthly_generalization_gap.csv`)
+- [x] ออกแบบตารางและกราฟเปรียบเทียบ Generalization Gap (RMSE & MAE บน HII vs DWR Hold-Out)
+- [x] จัดวางเทมเพลตสำหรับเขียนสรุปผลงานวิจัยเพื่อตอบครบทั้ง 5 RQs (RQ1–RQ5) พร้อมหลักฐานเชิงประจักษ์จาก RMSE และ MAE ตลอดทั้ง 12 เดือน
