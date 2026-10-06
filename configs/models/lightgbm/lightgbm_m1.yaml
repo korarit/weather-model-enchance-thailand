@@ -1,0 +1,24 @@
+experiment_id: LIGHTGBM_M1
+model_name: lightgbm
+ablation_variant: m1
+variant_description: NWP + Topo + Ground Telemetry
+data:
+  train_years:
+  - 2021
+  - 2022
+  - 2023
+  - 2024
+  val_years:
+  - 2024
+  frozen_test_year: 2025
+  target_column: target_bias
+  nwp_rain_column: nwp_rain_raw
+model_type: gbdt_leaf_wise
+objective: regression_l1
+hyperparameters:
+  n_estimators: 500
+  learning_rate: 0.05
+  num_leaves: 31
+  subsample: 0.8
+  colsample_bytree: 0.8
+  min_child_samples: 20

@@ -1,0 +1,23 @@
+experiment_id: HURDLE_M3
+model_name: hurdle
+ablation_variant: m3
+variant_description: NWP + Topo + Ground + Himawari-9 Satellite
+data:
+  train_years:
+  - 2021
+  - 2022
+  - 2023
+  - 2024
+  val_years:
+  - 2024
+  frozen_test_year: 2025
+  target_column: target_bias
+  nwp_rain_column: nwp_rain_raw
+model_type: two_stage_hurdle
+stage1_objective: binary_logloss
+stage2_objective: regression_l1
+hyperparameters:
+  clf_n_estimators: 400
+  reg_n_estimators: 400
+  prob_threshold: 0.35
+  rain_threshold: 0.1

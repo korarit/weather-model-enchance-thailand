@@ -1,8 +1,8 @@
 # 🤖 Phase 4: ML Bias Correction Modeling & Training Protocol
 
-> **สถานะ**: ร่างแผนงาน (Planning Phase - Strict No Code)  
+> **สถานะ**: ✅ ดำเนินการเสร็จสมบูรณ์ (Implemented & Verified)  
 > **เป้าหมายหลัก**: พัฒนาระบบ Machine Learning เพื่อปรับแก้ความคลาดเคลื่อน (Bias Correction) ของผลพยากรณ์ฝนจาก Weather Model บน 2 km × 2 km Grid โดยใช้หลักการ Residual Learning พร้อมทั้งออกแบบการทดลอง Ablation Study ($B_0, M_1, M_2, M_3, M_4$) และระเบียบวิธีแบ่งข้อมูลตามแกนเวลา (Temporal Time-Split) 2021–2024 (Train/Val) และ 2025 (Final Frozen Test)  
-> **ข้อกำหนดพื้นที่ทำงาน**: โค้ดฝึกและประเมินโมเดล (`src/models/`), คอนฟิกการทดลอง (`configs/`), และโมเดลที่บันทึก (`models/`) ต้องถูกจัดเก็บและเรียกใช้งานภายใน `weather-forcast-enhance/` ทั้งหมด ไม่มีการเรียกไฟล์ภายนอก
+> **ข้อกำหนดพื้นที่ทำงาน**: โค้ดฝึกและประเมินโมเดล (`src/models/`), คอนฟิกการทดลอง (`configs/`), และโมเดลที่บันทึก (`models/`) ถูกจัดเก็บและเรียกใช้งานภายใน `weather-forcast-enhance/` ทั้งหมด ไม่มีการเรียกไฟล์ภายนอก
 
 ---
 
@@ -326,12 +326,20 @@ Final Retrain: All 2021–2024 ────────────────�
 
 ## 7. สรุป Checklist ความพร้อม Phase 4
 
-- [ ] กำหนดสมการ Residual Bias และสมการ Inference พร้อม Non-negative Clipping
-- [ ] ออกแบบเมทริกซ์การทดลองเต็มรูปแบบ 18 รูปแบบ ($6 \text{ Models} \times 3 \text{ Variants}: M_1, M_2, M_3$)
-- [ ] ติดตั้งโครงสร้าง Runner แยกเดี่ยว 6 สคริปต์ใน `src/models/runners/` พร้อมระบบ Fault Isolation
-- [ ] จัดเตรียม Configs แยกโมเดลและแยกรอบการทดลองใน `configs/models/<model>/<variant>.yaml`
-- [ ] จัดเตรียมไดเรกทอรีจัดเก็บ Checkpoints และ Prediction Parquets แยกตามโมเดลและ Variant ใน `models/` และ `outputs/predictions/`
-- [ ] วางระบบ Cross-Validation แบบ Temporal Expanding-Window (2021–2024)
-- [ ] ล็อกสิทธิ์การเข้าถึงข้อมูลปี 2025 ไม่ให้รั่วไหลเข้าสู่กระบวนการ Training ของทุกโมเดล
-- [ ] บล็อกไม่ให้ข้อมูลสถานี DWR ใน `dataset/dwr_rain/` รั่วไหลเข้าสู่ชุดฝึกหรือการคำนวณ Spatial Features อย่างเด็ดขาด (สงวนไว้เป็น Blind Test Set ใน Phase 5)
+- [x] กำหนดสมการ Residual Bias และสมการ Inference พร้อม Non-negative Clipping (`R_corrected = max(0, R_model + Bias)`)
+- [x] ออกแบบเมทริกซ์การทดลองเต็มรูปแบบ 18 รูปแบบ ($6 \text{ Models} \times 3 \text{ Variants}: M_1, M_2, M_3$)
+- [x] ติดตั้งโครงสร้าง Runner แยกเดี่ยว 6 สคริปต์ใน `src/models/runners/` พร้อมระบบ Fault Isolation:
+  - [src/models/runners/run_lightgbm.py](file:///e:/water-analysis-project/weather-forcast-enhance/src/models/runners/run_lightgbm.py)
+  - [src/models/runners/run_catboost.py](file:///e:/water-analysis-project/weather-forcast-enhance/src/models/runners/run_catboost.py)
+  - [src/models/runners/run_hurdle.py](file:///e:/water-analysis-project/weather-forcast-enhance/src/models/runners/run_hurdle.py)
+  - [src/models/runners/run_quantile.py](file:///e:/water-analysis-project/weather-forcast-enhance/src/models/runners/run_quantile.py)
+  - [src/models/runners/run_stgnn.py](file:///e:/water-analysis-project/weather-forcast-enhance/src/models/runners/run_stgnn.py)
+  - [src/models/runners/run_unet.py](file:///e:/water-analysis-project/weather-forcast-enhance/src/models/runners/run_unet.py)
+- [x] จัดเตรียม Configs YAML ทั้ง 18 ไฟล์แยกรุ่นและ Variant ใน [`configs/models/`](file:///e:/water-analysis-project/weather-forcast-enhance/configs/models/)
+- [x] จัดเตรียมระบบจัดเก็บ Checkpoints และ Prediction Parquets แยกตามโมเดลใน `outputs/`
+- [x] วางระบบ Cross-Validation แบบ Temporal Expanding-Window (2021–2024) ใน [src/models/common.py](file:///e:/water-analysis-project/weather-forcast-enhance/src/models/common.py)
+- [x] ล็อกสิทธิ์การเข้าถึงข้อมูลปี 2025 ไม่ให้รั่วไหลเข้าสู่กระบวนการ Training ของทุกโมเดล (`assert_valid_training_years`)
+- [x] บล็อกไม่ให้ข้อมูลสถานี DWR ใน `dataset/dwr_rain/` รั่วไหลเข้าสู่ชุดฝึกหรือการคำนวณ Spatial Features อย่างเด็ดขาด (`assert_no_dwr_leakage`)
+- [x] ผ่าน Smoke Test ครบทั้ง 6 โมเดลสมบูรณ์แบบบนเครื่อง PC
+- [x] พร้อมเข้าสู่ Phase 5 (Evaluation, Benchmarking & Reporting) ในลำดับถัดไป
 

@@ -46,3 +46,8 @@ data/geo/*
 !data/geo/.gitkeep
 data/features/*
 !data/features/.gitkeep
+
+# Models & Outputs
+/models/
+/outputs/
+/catboost_info/
