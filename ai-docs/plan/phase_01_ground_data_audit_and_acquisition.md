@@ -143,6 +143,23 @@ flowchart TD
    - `max_consecutive_missing_hours`
    - `completeness_percentage`: $\frac{\text{valid\_rows}}{43,824} \times 100\%$
 
+### ขั้นตอนที่ 5.3: โหมดการทำงานระหว่างพัฒนา (Local Dev Mode) vs การรันจริง (Server Production Run)
+
+> [!IMPORTANT]
+> **ข้อกำหนดการประหยัดทรัพยากรบนเครื่อง PC:**
+> - **ช่วงพัฒนาบน PC (Dev Mode)**: สคริปต์ `hii_audit.py` และ `hii_downloader.py` จะรันด้วยแฟล็ก `--sample` (เช่น `--limit-stations 3-5` หรือ `--months 202101`) เพื่อทดสอบว่าฟังก์ชันเชื่อมต่อ, ตัวแปลงไฟล์ CSV $\rightarrow$ Parquet, และตรรกะตรวจสอบ Null ทำงานได้ถูกต้องสมบูรณ์ โดย**ไม่มีการดาวน์โหลดชุดข้อมูลเต็ม 60 เดือนบน PC**
+> - **การรันเต็มรูปแบบ (Full Production Run)**: คำสั่ง `--full` (สแกนทั้ง 60 เดือนทุกสถานีทั่วประเทศ) จะถูกนำไปสั่งรันจริงบน **Server** เพื่อไม่ให้กระทบต่อความจุและประสิทธิภาพของเครื่อง PC
+
+```bash
+# บนเครื่อง PC (ช่วงพัฒนา - โหลดตัวอย่างขนาดเล็กเพื่อทดสอบฟังก์ชัน):
+python src/data/hii_audit.py --mode sample --limit-stations 5 --months 202101
+python src/data/hii_downloader.py --sample --stations 5
+
+# บน Server (รันจริงเมื่อระบบพร้อม):
+python src/data/hii_audit.py --mode full --all-catalogs
+python src/data/hii_downloader.py --full --all-catalogs
+```
+
 ---
 
 ## 6. โครงสร้างผลลัพธ์ของ Phase 1 (Deliverable Reports & Artifacts)

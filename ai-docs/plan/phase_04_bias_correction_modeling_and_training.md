@@ -243,18 +243,26 @@ weather-forcast-enhance/
         └── unet/       # unet_m1_pred.csv, ...
 ```
 
-### 4.2 มาตรฐาน Command Line Interface (CLI) และตัวเลือก `--dir`
+### 4.2 มาตรฐาน Command Line Interface (CLI), แฟล็ก `--dir` และ `--smoke-test`
 
-ทุก Runner สคริปต์ใน `src/models/runners/` ต้องรองรับ argument `--dir` เพื่อให้ผู้ใช้สามารถกำหนดไดเรกทอรีปลายทางสำหรับจัดเก็บผลลัพธ์ได้อย่างอิสระ:
+> [!CAUTION]
+> 🚨 **กฎเหล็กเด็ดขาด: ห้ามสั่งรันโมเดล Training เต็มรูปแบบบนเครื่อง PC โดยเด็ดขาด!**  
+> เนื่องจากทรัพยากรการคำนวณ (Compute Resources) ของเครื่อง PC มีขีดจำกัด ไม่สามารถรองรับการเทรนข้อมูลฝนทั้งประเทศตลอด 4 ปี (2021–2024) ได้:
+> 1. **บนเครื่อง PC (Local Dev Scope)**:
+>    - อนุญาตเฉพาะการทำ **Smoke Test** ผ่านแฟล็ก `--smoke-test` (เช่น โหลดข้อมูลจำลอง Mock/Dummy เล็กๆ 50–100 แถว รัน 1 epoch / 1 tree iteration) เพื่อพิสูจน์ว่า Logic ของโค้ด, การคำนวณ Loss, การเซฟ Checkpoint ใน `models/` และการส่งออก CSV Result ใน `predictions/` ทำงานถูกต้องปราศจาก Syntax/Runtime Error
+>    - **ห้ามสั่งรัน Full Training บน PC เด็ดขาด**
+> 2. **บน Server (Production Training Scope)**:
+>    - ผู้ใช้จะเป็นผู้นำโค้ดทั้งหมดขึ้นไปรัน Full Training (18 Pipelines: $6 \text{ Models} \times 3 \text{ Variants}$) บนเครื่อง **Server** ด้วยตนเอง
 
 ```bash
-# ตัวอย่างการสั่งรันพร้อมระบุ --dir ปลายทาง
+# บนเครื่อง PC (ช่วงพัฒนา - รันเฉพาะ Smoke Test 50 แถวเพื่อตรวจโค้ด):
+python src/models/runners/run_lightgbm.py --ablation m1 --smoke-test --dir outputs/smoke_test/
+python src/models/runners/run_hurdle.py   --ablation m3 --smoke-test --dir outputs/smoke_test/
+
+# บน Server (รันจริงเมื่อเตรียมนำขึ้น Server):
 python src/models/runners/run_lightgbm.py --ablation m3 --config configs/models/lightgbm/lgbm_m3.yaml --dir outputs/benchmark_2025/
 python src/models/runners/run_hurdle.py   --ablation m3 --config configs/models/hurdle/hurdle_m3.yaml   --dir outputs/hurdle_experiment/
 python src/models/runners/run_catboost.py --ablation all --dir outputs/catboost_full_runs/
-
-# หากไม่ระบุ --dir ระบบจะกำหนดค่าเริ่มต้น (Default) เป็น: outputs/
-python src/models/runners/run_lightgbm.py --ablation m1
 ```
 
 #### รายละเอียดโครงสร้าง CSV Result การพยากรณ์ (`--dir/predictions/<model>/<model>_<ablation>_pred.csv`):

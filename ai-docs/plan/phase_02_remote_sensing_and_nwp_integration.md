@@ -56,6 +56,24 @@ lead_time = forecast_valid_time - forecast_run_time (เช่น 6h, 12h, 18h, 
 3. บันทึกผลลัพธ์เป็นตาราง Parquet แยกตามโมเดล:
    `weather-forcast-enhance/data/nwp_forecasts/{origin}/run_{YYYYMMDD}_{HHz}.parquet`
 
+### 1.4 โหมดการดาวน์โหลดระหว่างพัฒนา (Dev Sample Mode) vs การรันเต็มบน Server (Server Full Run)
+
+> [!CAUTION]
+> **กฎการป้องกัน Overload บนเครื่อง PC:**
+> - ข้อมูล TIGGE GRIB2 และภาพถ่ายดาวเทียม Himawari-9 ตลอด 5 ปี มีขนาดหลายสิบ Gigabytes **ห้ามสั่งดาวน์โหลด Full ชุดข้อมูลบน PC เด็ดขาด**
+> - **บนเครื่อง PC (Dev Mode)**: ให้สั่งดาวน์โหลดช่วงเวลาสั้นๆ (Sample Window เช่น 3 วัน) เพื่อทดสอบตรรกะการแปลง GRIB2 $\rightarrow$ 2 km Grid และการสกัด $\Delta BT$
+> - **บน Server**: จึงจะสั่งรันดาวน์โหลดเต็ม 2021–2025
+
+```bash
+# บนเครื่อง PC (ช่วงพัฒนา - ดึงเพียง 2-3 วันเพื่อทดสอบ Parser และ Grid Mapping):
+python src/data/tigge_downloader.py --sample-days 3 --origins ecmf,kwbc
+python src/data/himawari_extractor.py --sample-hours 12
+
+# บน Server (รันจริงเมื่อเตรียมนำขึ้น Server):
+python src/data/tigge_downloader.py --full --start 2021-01-01 --end 2025-12-31
+python src/data/himawari_extractor.py --full --start 2021-01-01 --end 2025-12-31
+```
+
 ---
 
 ## 2. การประมวลผลข้อมูลดาวเทียม Himawari-9 (Satellite Cloud Features)
