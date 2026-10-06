@@ -38,3 +38,7 @@ __pycache__/
 data/raw/
 data/clean_parquet/*
 !data/clean_parquet/.gitkeep
+data/nwp_forecasts/*
+!data/nwp_forecasts/.gitkeep
+data/himawari9/*
+!data/himawari9/.gitkeep

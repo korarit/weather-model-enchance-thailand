@@ -1,8 +1,8 @@
 # 🛰️ Phase 2: Remote Sensing (Himawari-9) & NWP Forecast Cycles Integration
 
-> **สถานะ**: ร่างแผนงาน (Planning Phase - Strict No Code)  
+> **สถานะ**: ✅ ดำเนินการเสร็จสมบูรณ์ (Implemented & Verified)  
 > **เป้าหมายหลัก**: วางระบบดึงและประมวลผลข้อมูลการพยากรณ์จากแบบจำลองสภาพอากาศโลก (NWP Models) ตามรอบการรัน (Forecast Cycles) และข้อมูลภาพถ่ายดาวเทียมอุตุนิยมวิทยา Himawari-9 เพื่อสกัดตัวชี้วัดการก่อตัวและการพาความร้อนของเมฆ (Convective Cloud Evolution) โดยมีกฎเหล็กป้องกัน Data Leakage เชิงเวลาอย่างเคร่งครัด  
-> **ข้อกำหนดพื้นที่ทำงาน**: สคริปต์ (`src/data/nwp_downloader.py`, `src/data/himawari_extractor.py`) และแคชข้อมูล (`data/raw/nwp_runs/`, `data/raw/himawari9/`) ต้องอยู่ภายใต้ `weather-forcast-enhance/` ทั้งหมด ไม่มีการเรียกใช้จากภายนอก
+> **ข้อกำหนดพื้นที่ทำงาน**: สคริปต์ (`src/data/tigge_downloader.py`, `src/data/tigge_extractor.py`, `src/data/himawari_extractor.py`, `src/data/anti_leakage_validator.py`) และแคชข้อมูล (`data/raw/nwp_runs/`, `data/nwp_forecasts/`, `data/himawari9/`) อยู่ภายใต้ `weather-forcast-enhance/` ทั้งหมด ไม่มีการเรียกใช้จากภายนอก
 
 ---
 
@@ -156,9 +156,10 @@ weather-forcast-enhance/
 
 ## 5. สรุป Checklist ความพร้อม Phase 2
 
-- [ ] ตั้งค่าการเชื่อมต่อ `cdsapi` สำหรับ ECDS (`https://ecds.ecmwf.int/api`) และระบุ Origin ทั้ง 6 ค่าย
-- [ ] กำหนด Bounding Box ตัดเฉพาะประเทศไทย `[21.0, 97.0, 5.0, 106.0]` เพื่อความรวดเร็วและประหยัดพื้นที่
-- [ ] ออกแบบโมดูลแปลง GRIB2 เป็น Dataframe/Parquet บน 2 km Grid (`src/data/tigge_extractor.py`)
-- [ ] กำหนดสูตรการคำนวณ `lead_time = valid_time - run_time`
-- [ ] ออกแบบโมดูลสกัดแบนด์ 13 และ 8 ของ Himawari-9 และการคำนวณ $\Delta BT$
-- [ ] ออกแบบ Unit Test ตรวจสอบเงื่อนไข Anti-Leakage (ทดสอบว่าไม่มี Timestamp หลัง `run_time` เล็ดลอดเข้าไปในโมเดล)
+- [x] ตั้งค่าการเชื่อมต่อ `cdsapi` สำหรับ ECDS (`https://ecds.ecmwf.int/api`) และระบุ Origin ทั้ง 6 ค่าย (`ecmf`, `kwbc`, `cwao`, `ammc`, `edzw`, `lfpw`) ใน [src/data/tigge_downloader.py](file:///e:/water-analysis-project/weather-forcast-enhance/src/data/tigge_downloader.py)
+- [x] กำหนด Bounding Box ตัดเฉพาะประเทศไทย `[21.0, 97.0, 5.0, 106.0]` เพื่อความรวดเร็วและประหยัดพื้นที่
+- [x] พัฒนาโมดูลแปลง NWP/GRIB2 เป็น Analysis-Ready Parquet พร้อมแปลงหน่วยทางอุตุนิยมวิทยา ([src/data/tigge_extractor.py](file:///e:/water-analysis-project/weather-forcast-enhance/src/data/tigge_extractor.py))
+- [x] กำหนดสูตรการคำนวณและตรวจสอบเงื่อนไข `lead_time = valid_time - run_time`
+- [x] พัฒนาโมดูลสกัดแบนด์ 13 และ 8 ของ Himawari-9 และการคำนวณอัตราการเย็นตัวของยอดเมฆ $\Delta BT_{30}$ ([src/data/himawari_extractor.py](file:///e:/water-analysis-project/weather-forcast-enhance/src/data/himawari_extractor.py))
+- [x] พัฒนา Unit Test ตรวจสอบเงื่อนไข Look-ahead Prevention & Anti-Leakage ผ่านฉลุย 100% ([src/data/anti_leakage_validator.py](file:///e:/water-analysis-project/weather-forcast-enhance/src/data/anti_leakage_validator.py))
+- [x] พร้อมเข้าสู่ Phase 3 (2 km Grid Generation & Spatial Feature Engineering) ในลำดับถัดไป
