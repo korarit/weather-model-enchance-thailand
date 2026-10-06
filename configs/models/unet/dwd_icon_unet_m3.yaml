@@ -1,0 +1,24 @@
+experiment_id: DWD_ICON_UNET_M3
+weather_model: dwd_icon
+model_name: unet
+ablation_variant: m3
+variant_description: '[DWD_ICON] NWP + Topo + Ground + Himawari-9 Satellite'
+data:
+  train_years:
+  - 2021
+  - 2022
+  - 2023
+  - 2024
+  val_years:
+  - 2024
+  frozen_test_year: 2025
+  target_column: target_bias
+  nwp_rain_column: nwp_rain_dwd_icon
+model_type: conv_unet_2d
+objective: huber_loss
+hyperparameters:
+  epochs: 40
+  batch_size: 32
+  hidden_dim: 32
+  lr: 0.005
+  weight_decay: 0.0001

@@ -1,0 +1,24 @@
+experiment_id: NCEP_GFS_CATBOOST_M1
+weather_model: ncep_gfs
+model_name: catboost
+ablation_variant: m1
+variant_description: '[NCEP_GFS] NWP + Topo + Ground Telemetry'
+data:
+  train_years:
+  - 2021
+  - 2022
+  - 2023
+  - 2024
+  val_years:
+  - 2024
+  frozen_test_year: 2025
+  target_column: target_bias
+  nwp_rain_column: nwp_rain_ncep_gfs
+model_type: oblivious_trees
+objective: RMSE
+hyperparameters:
+  iterations: 600
+  learning_rate: 0.06
+  depth: 6
+  l2_leaf_reg: 3.0
+  random_seed: 42

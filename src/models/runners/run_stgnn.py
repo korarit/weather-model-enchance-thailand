@@ -25,6 +25,7 @@ from src.models.common import (
     export_predictions,
     assert_no_dwr_leakage,
     assert_valid_training_years,
+    resolve_runner_execution_targets,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,11 +83,12 @@ def train_and_eval_stgnn(
     df: pd.DataFrame,
     ablation: str,
     output_dir: Path,
+    weather_model: str = "ecmwf_ifs",
     smoke_test: bool = False
 ):
     """Trains ST-GNN on spatial graph and exports predictions."""
     features = ABLATION_FEATURES[ablation]
-    logger.info("Training ST-GNN [%s] with %d features (smoke_test=%s)...", ablation.upper(), len(features), smoke_test)
+    logger.info("Training ST-GNN on [%s] [%s] with %d features (smoke_test=%s)...", weather_model.upper(), ablation.upper(), len(features), smoke_test)
 
     X_mat = df[features].copy().fillna(0.0).to_numpy(dtype=np.float32)
     y_vec = df["target_bias"].to_numpy(dtype=np.float32)
@@ -119,7 +121,7 @@ def train_and_eval_stgnn(
         optimizer.step()
 
     # Save model checkpoint
-    model_dir = output_dir / "models" / "stgnn" / ablation
+    model_dir = output_dir / "models" / "stgnn" / weather_model / ablation
     model_dir.mkdir(parents=True, exist_ok=True)
     ckpt_file = model_dir / "checkpoint.pt"
     torch.save(model.state_dict(), ckpt_file)
@@ -135,13 +137,15 @@ def train_and_eval_stgnn(
         predicted_bias=val_pred_bias,
         model_name="stgnn",
         ablation=ablation,
-        output_dir=output_dir
+        output_dir=output_dir,
+        weather_model=weather_model,
     )
 
 
 def main():
     parser = argparse.ArgumentParser(description="ST-GNN Bias Correction Runner")
-    parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default="m3", help="Feature ablation variant")
+    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "meteo_arpege", "all"], default=None, help="Target Weather Model (or 'all')")
+    parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default=None, help="Feature ablation variant")
     parser.add_argument("--smoke-test", action="store_true", help="Run rapid smoke test on PC")
     parser.add_argument("--dir", type=str, default="outputs/stgnn/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")
@@ -149,17 +153,24 @@ def main():
     args = parser.parse_args()
 
     output_dir = PROJECT_ROOT / args.dir
+    weather_models, ablations, hyperparams = resolve_runner_execution_targets(
+        config_path=args.config,
+        weather_model_arg=args.weather_model,
+        ablation_arg=args.ablation,
+    )
 
-    if args.data_file:
-        assert_no_dwr_leakage(args.data_file)
-        df = pd.read_parquet(args.data_file)
-        assert_valid_training_years(df)
-    else:
-        df = generate_smoke_test_dataset(n_samples=100)
+    logger.info("ST-GNN Runner Targets -> Weather Models: %s | Ablations: %s", weather_models, ablations)
 
-    ablations = ["m1", "m2", "m3"] if args.ablation == "all" else [args.ablation]
-    for ab in ablations:
-        train_and_eval_stgnn(df, ab, output_dir=output_dir, smoke_test=args.smoke_test)
+    for wm in weather_models:
+        if args.data_file:
+            assert_no_dwr_leakage(args.data_file)
+            df = pd.read_parquet(args.data_file)
+            assert_valid_training_years(df)
+        else:
+            df = generate_smoke_test_dataset(n_samples=100, weather_model=wm)
+
+        for ab in ablations:
+            train_and_eval_stgnn(df, ab, output_dir=output_dir, weather_model=wm, smoke_test=args.smoke_test)
 
 
 if __name__ == "__main__":

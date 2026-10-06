@@ -77,13 +77,32 @@ def assert_valid_training_years(df: pd.DataFrame, time_col: str = "valid_time"):
         )
 
 
-def generate_smoke_test_dataset(n_samples: int = 100, seed: int = 42) -> pd.DataFrame:
-    """Generates realistic synthetic tabular rows for local PC smoke tests."""
+SUPPORTED_WEATHER_MODELS = [
+    "ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "meteo_arpege"
+]
+
+
+def generate_smoke_test_dataset(
+    n_samples: int = 100,
+    weather_model: str = "ecmwf_ifs",
+    seed: int = 42
+) -> pd.DataFrame:
+    """Generates realistic synthetic tabular rows for local PC smoke tests per weather model."""
     np.random.seed(seed)
     run_times = pd.date_range("2021-01-01 00:00:00", periods=4, freq="12h")
     records = []
     
     basins = ["Chao Phraya", "Chi", "Mun", "Yom", "Ping", "Nan", "Tha Chin", "Mae Klong"]
+
+    # Model specific bias characteristics
+    model_bias_offset = {
+        "ecmwf_ifs": 0.35,
+        "ncep_gfs": 0.55,
+        "dwd_icon": 0.45,
+        "cmc_gem": 0.60,
+        "bom_access": 0.50,
+        "meteo_arpege": 0.55,
+    }.get(weather_model, 0.4)
 
     for i in range(n_samples):
         rt = np.random.choice(run_times)
@@ -94,7 +113,7 @@ def generate_smoke_test_dataset(n_samples: int = 100, seed: int = 42) -> pd.Data
         stn = f"HII_{1000 + (i % 25)}"
         basin = np.random.choice(basins)
 
-        nwp_rain = float(round(max(0.0, np.random.exponential(1.5) if np.random.rand() < 0.4 else 0.0), 2))
+        nwp_rain = float(round(max(0.0, np.random.exponential(1.5 + model_bias_offset * 0.3) if np.random.rand() < 0.4 else 0.0), 2))
         
         # Synthetic observed rain with bias
         bias_true = float(np.random.normal(0.5, 1.2)) if nwp_rain > 0 else (float(np.random.exponential(0.8)) if np.random.rand() < 0.15 else 0.0)
@@ -105,6 +124,7 @@ def generate_smoke_test_dataset(n_samples: int = 100, seed: int = 42) -> pd.Data
             "run_time": rt,
             "valid_time": vt,
             "lead_time_hours": lead,
+            "weather_model": weather_model,
             "station_id": stn,
             "basin_id": basin,
             "lat": lat,
@@ -161,12 +181,13 @@ def export_predictions(
     model_name: str,
     ablation: str,
     output_dir: Path,
+    weather_model: str = "ecmwf_ifs",
     quantile_preds: Optional[Dict[str, np.ndarray]] = None
 ) -> Tuple[Path, Path]:
     """
     Exports standardized predictions CSV and Parquet:
     - corrected_rain = max(0.0, nwp_raw_rain + predicted_bias)
-    - Output location: [output_dir]/predictions/[model_name]/[model_name]_[ablation]_pred.csv
+    - Output location: [output_dir]/predictions/[model_name]/[weather_model]_[model_name]_[ablation]_pred.csv
     """
     pred_dir = output_dir / "predictions" / model_name
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -179,6 +200,7 @@ def export_predictions(
         "valid_time": pd.to_datetime(df["valid_time"]).dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "run_time": pd.to_datetime(df["run_time"]).dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "lead_time": df["lead_time_hours"].astype(int),
+        "weather_model": weather_model,
         "station_id": df.get("station_id", df.get("grid_id", "STN_UNKNOWN")),
         "lat": df["lat"].astype(np.float32),
         "lon": df["lon"].astype(np.float32),
@@ -195,10 +217,77 @@ def export_predictions(
         for q_name, q_vals in quantile_preds.items():
             out_df[q_name] = np.maximum(0.0, nwp_raw + q_vals).astype(np.float32)
 
-    csv_path = pred_dir / f"{model_name}_{ablation}_pred.csv"
-    parquet_path = pred_dir / f"{model_name}_{ablation}_pred.parquet"
+    csv_path = pred_dir / f"{weather_model}_{model_name}_{ablation}_pred.csv"
+    parquet_path = pred_dir / f"{weather_model}_{model_name}_{ablation}_pred.parquet"
 
     out_df.to_csv(csv_path, index=False)
     out_df.to_parquet(parquet_path, index=False, compression="snappy")
-    logger.info("Exported predictions for %s (%s): %s (%d rows)", model_name, ablation, csv_path.name, len(out_df))
+    
+    # Also save standard filename for backward compatibility
+    compat_csv = pred_dir / f"{model_name}_{ablation}_pred.csv"
+    out_df.to_csv(compat_csv, index=False)
+    
+    logger.info("Exported predictions for %s [%s] (%s): %s (%d rows)", weather_model, model_name, ablation, csv_path.name, len(out_df))
     return csv_path, parquet_path
+
+
+def resolve_runner_execution_targets(
+    config_path: Optional[str] = None,
+    weather_model_arg: Optional[str] = None,
+    ablation_arg: Optional[str] = None,
+) -> Tuple[List[str], List[str], Dict]:
+    """
+    Resolves execution targets (weather_models, ablations, hyperparams) from CLI arguments
+    and optional YAML config.
+    Supports:
+    - --weather-model all -> ["ecmwf_ifs", "ncep_gfs", "dwd_icon"]
+    - --weather-model [wm] -> [wm]
+    - --ablation all -> ["m1", "m2", "m3"]
+    - --ablation [ab] -> [ab]
+    - --config path/to/config.yaml -> loads weather_model, ablation_variant, hyperparameters
+    """
+    config_data = {}
+    if config_path:
+        cfg_p = Path(config_path)
+        if not cfg_p.is_absolute():
+            if (PROJECT_ROOT / cfg_p).exists():
+                cfg_p = PROJECT_ROOT / cfg_p
+            elif not cfg_p.exists():
+                parts = cfg_p.parts
+                if len(parts) >= 3 and parts[0] == "configs" and parts[1] == "models":
+                    filename = parts[-1]
+                    m_name = filename.split("_")[0]
+                    alt_p = PROJECT_ROOT / "configs" / "models" / m_name / filename
+                    if alt_p.exists():
+                        cfg_p = alt_p
+        if cfg_p.exists():
+            import yaml
+            with open(cfg_p, "r", encoding="utf-8") as f:
+                config_data = yaml.safe_load(f) or {}
+            logger.info("Loaded configuration from: %s", cfg_p)
+        else:
+            logger.warning("Config path %s not found. Proceeding with CLI arguments.", config_path)
+
+    # Resolve target weather models
+    target_wm = weather_model_arg
+    if target_wm is None or (target_wm == "ecmwf_ifs" and "weather_model" in config_data):
+        target_wm = config_data.get("weather_model", "ecmwf_ifs")
+
+    if target_wm == "all":
+        weather_models = ["ecmwf_ifs", "ncep_gfs", "dwd_icon"]
+    else:
+        weather_models = [target_wm]
+
+    # Resolve target ablation variants
+    target_ab = ablation_arg
+    if target_ab is None or (target_ab == "m3" and "ablation_variant" in config_data):
+        target_ab = config_data.get("ablation_variant", "m3")
+
+    if target_ab == "all":
+        ablations = ["m1", "m2", "m3"]
+    else:
+        ablations = [target_ab]
+
+    hyperparams = config_data.get("hyperparameters", {})
+    return weather_models, ablations, hyperparams
+

@@ -23,6 +23,7 @@ from src.models.common import (
     export_predictions,
     assert_no_dwr_leakage,
     assert_valid_training_years,
+    resolve_runner_execution_targets,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,11 +34,13 @@ def train_and_eval_lgbm(
     df: pd.DataFrame,
     ablation: str,
     output_dir: Path,
-    smoke_test: bool = False
+    weather_model: str = "ecmwf_ifs",
+    smoke_test: bool = False,
+    hyperparams: dict = None,
 ):
     """Trains LightGBM regressor on residual bias and exports predictions."""
     features = ABLATION_FEATURES[ablation]
-    logger.info("Training LightGBM [%s] with %d features (smoke_test=%s)...", ablation.upper(), len(features), smoke_test)
+    logger.info("Training LightGBM on [%s] [%s] with %d features (smoke_test=%s)...", weather_model.upper(), ablation.upper(), len(features), smoke_test)
 
     X = df[features].copy()
     y = df["target_bias"].copy()
@@ -61,12 +64,14 @@ def train_and_eval_lgbm(
         "verbose": -1,
         "random_state": 42,
     }
+    if hyperparams and not smoke_test:
+        params.update(hyperparams)
 
     model = lgb.LGBMRegressor(**params)
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(5, verbose=False)] if not smoke_test else None)
 
     # Save model checkpoint
-    model_dir = output_dir / "models" / "lightgbm" / ablation
+    model_dir = output_dir / "models" / "lightgbm" / weather_model / ablation
     model_dir.mkdir(parents=True, exist_ok=True)
     ckpt_file = model_dir / "model.txt"
     model.booster_.save_model(str(ckpt_file))
@@ -79,13 +84,15 @@ def train_and_eval_lgbm(
         predicted_bias=val_pred_bias,
         model_name="lightgbm",
         ablation=ablation,
-        output_dir=output_dir
+        output_dir=output_dir,
+        weather_model=weather_model,
     )
 
 
 def main():
     parser = argparse.ArgumentParser(description="LightGBM Bias Correction Runner")
-    parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default="m3", help="Feature ablation variant")
+    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "meteo_arpege", "all"], default=None, help="Target Weather Model (or 'all')")
+    parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default=None, help="Feature ablation variant")
     parser.add_argument("--smoke-test", action="store_true", help="Run rapid smoke test on PC (50-100 rows, 1-2 trees)")
     parser.add_argument("--dir", type=str, default="outputs/lightgbm/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")
@@ -93,18 +100,26 @@ def main():
     args = parser.parse_args()
 
     output_dir = PROJECT_ROOT / args.dir
+    weather_models, ablations, hyperparams = resolve_runner_execution_targets(
+        config_path=args.config,
+        weather_model_arg=args.weather_model,
+        ablation_arg=args.ablation,
+    )
 
-    if args.data_file:
-        assert_no_dwr_leakage(args.data_file)
-        df = pd.read_parquet(args.data_file)
-        assert_valid_training_years(df)
-    else:
-        df = generate_smoke_test_dataset(n_samples=100)
+    logger.info("LightGBM Runner Targets -> Weather Models: %s | Ablations: %s", weather_models, ablations)
 
-    ablations = ["m1", "m2", "m3"] if args.ablation == "all" else [args.ablation]
-    for ab in ablations:
-        train_and_eval_lgbm(df, ab, output_dir=output_dir, smoke_test=args.smoke_test)
+    for wm in weather_models:
+        if args.data_file:
+            assert_no_dwr_leakage(args.data_file)
+            df = pd.read_parquet(args.data_file)
+            assert_valid_training_years(df)
+        else:
+            df = generate_smoke_test_dataset(n_samples=100, weather_model=wm)
+
+        for ab in ablations:
+            train_and_eval_lgbm(df, ab, output_dir=output_dir, weather_model=wm, smoke_test=args.smoke_test, hyperparams=hyperparams)
 
 
 if __name__ == "__main__":
     main()
+

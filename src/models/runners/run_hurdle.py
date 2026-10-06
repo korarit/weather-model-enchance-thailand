@@ -25,6 +25,7 @@ from src.models.common import (
     export_predictions,
     assert_no_dwr_leakage,
     assert_valid_training_years,
+    resolve_runner_execution_targets,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,13 +36,15 @@ def train_and_eval_hurdle(
     df: pd.DataFrame,
     ablation: str,
     output_dir: Path,
+    weather_model: str = "ecmwf_ifs",
     rain_threshold: float = 0.1,
     prob_threshold: float = 0.35,
-    smoke_test: bool = False
+    smoke_test: bool = False,
+    hyperparams: dict = None,
 ):
     """Trains Two-Stage Hurdle Model and exports predictions."""
     features = ABLATION_FEATURES[ablation]
-    logger.info("Training Two-Stage Hurdle [%s] (smoke_test=%s)...", ablation.upper(), smoke_test)
+    logger.info("Training Two-Stage Hurdle on [%s] [%s] (smoke_test=%s)...", weather_model.upper(), ablation.upper(), smoke_test)
 
     X = df[features].copy().fillna(0.0)
     y_rain_binary = (df["observed_rain"] >= rain_threshold).astype(int)
@@ -70,18 +73,22 @@ def train_and_eval_hurdle(
     if pos_mask_train.sum() < 2:
         pos_mask_train = np.ones(len(y_bin_train), dtype=bool)
 
-    reg = lgb.LGBMRegressor(
-        objective="regression_l1",
-        n_estimators=n_estimators,
-        num_leaves=15 if smoke_test else 31,
-        learning_rate=0.05,
-        verbose=-1,
-        random_state=42
-    )
+    reg_params = {
+        "objective": "regression_l1",
+        "n_estimators": n_estimators,
+        "num_leaves": 15 if smoke_test else 31,
+        "learning_rate": 0.05,
+        "verbose": -1,
+        "random_state": 42
+    }
+    if hyperparams and not smoke_test:
+        reg_params.update(hyperparams)
+
+    reg = lgb.LGBMRegressor(**reg_params)
     reg.fit(X_train[pos_mask_train], y_bias_train[pos_mask_train])
 
     # Save checkpoints
-    model_dir = output_dir / "models" / "hurdle" / ablation
+    model_dir = output_dir / "models" / "hurdle" / weather_model / ablation
     model_dir.mkdir(parents=True, exist_ok=True)
     clf.booster_.save_model(str(model_dir / "clf.txt"))
     reg.booster_.save_model(str(model_dir / "reg.txt"))
@@ -100,13 +107,15 @@ def train_and_eval_hurdle(
         predicted_bias=final_bias_pred,
         model_name="hurdle",
         ablation=ablation,
-        output_dir=output_dir
+        output_dir=output_dir,
+        weather_model=weather_model,
     )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Two-Stage Hurdle GBDT Bias Correction Runner")
-    parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default="m3", help="Feature ablation variant")
+    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "meteo_arpege", "all"], default=None, help="Target Weather Model (or 'all')")
+    parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default=None, help="Feature ablation variant")
     parser.add_argument("--smoke-test", action="store_true", help="Run rapid smoke test on PC")
     parser.add_argument("--dir", type=str, default="outputs/hurdle/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")
@@ -114,17 +123,24 @@ def main():
     args = parser.parse_args()
 
     output_dir = PROJECT_ROOT / args.dir
+    weather_models, ablations, hyperparams = resolve_runner_execution_targets(
+        config_path=args.config,
+        weather_model_arg=args.weather_model,
+        ablation_arg=args.ablation,
+    )
 
-    if args.data_file:
-        assert_no_dwr_leakage(args.data_file)
-        df = pd.read_parquet(args.data_file)
-        assert_valid_training_years(df)
-    else:
-        df = generate_smoke_test_dataset(n_samples=100)
+    logger.info("Hurdle Runner Targets -> Weather Models: %s | Ablations: %s", weather_models, ablations)
 
-    ablations = ["m1", "m2", "m3"] if args.ablation == "all" else [args.ablation]
-    for ab in ablations:
-        train_and_eval_hurdle(df, ab, output_dir=output_dir, smoke_test=args.smoke_test)
+    for wm in weather_models:
+        if args.data_file:
+            assert_no_dwr_leakage(args.data_file)
+            df = pd.read_parquet(args.data_file)
+            assert_valid_training_years(df)
+        else:
+            df = generate_smoke_test_dataset(n_samples=100, weather_model=wm)
+
+        for ab in ablations:
+            train_and_eval_hurdle(df, ab, output_dir=output_dir, weather_model=wm, smoke_test=args.smoke_test, hyperparams=hyperparams)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,24 @@
+experiment_id: NCEP_GFS_STGNN_M1
+weather_model: ncep_gfs
+model_name: stgnn
+ablation_variant: m1
+variant_description: '[NCEP_GFS] NWP + Topo + Ground Telemetry'
+data:
+  train_years:
+  - 2021
+  - 2022
+  - 2023
+  - 2024
+  val_years:
+  - 2024
+  frozen_test_year: 2025
+  target_column: target_bias
+  nwp_rain_column: nwp_rain_ncep_gfs
+model_type: spatio_temporal_gnn
+objective: huber_loss
+hyperparameters:
+  epochs: 50
+  batch_size: 32
+  hidden_dim: 32
+  lr: 0.005
+  weight_decay: 0.0001

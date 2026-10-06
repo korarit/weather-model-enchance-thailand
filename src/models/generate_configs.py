@@ -82,31 +82,41 @@ VARIANTS = {
     "m3": {"name": "M3_Joint_Ground_Satellite", "desc": "NWP + Topo + Ground + Himawari-9 Satellite"},
 }
 
+TARGET_WEATHER_MODELS = ["ecmwf_ifs", "ncep_gfs", "dwd_icon"]
+
 def generate_configs():
-    for model_name, m_info in MODELS.items():
-        m_dir = CONFIG_BASE / model_name
-        m_dir.mkdir(parents=True, exist_ok=True)
-        
-        for v_code, v_info in VARIANTS.items():
-            cfg = {
-                "experiment_id": f"{model_name.upper()}_{v_code.upper()}",
-                "model_name": model_name,
-                "ablation_variant": v_code,
-                "variant_description": v_info["desc"],
-                "data": {
-                    "train_years": [2021, 2022, 2023, 2024],
-                    "val_years": [2024],
-                    "frozen_test_year": 2025,
-                    "target_column": "target_bias",
-                    "nwp_rain_column": "nwp_rain_raw",
-                },
-                **m_info
-            }
+    for wm in TARGET_WEATHER_MODELS:
+        for model_name, m_info in MODELS.items():
+            m_dir = CONFIG_BASE / model_name
+            m_dir.mkdir(parents=True, exist_ok=True)
             
-            out_file = m_dir / f"{model_name}_{v_code}.yaml"
-            with open(out_file, "w", encoding="utf-8") as f:
-                yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
-            print(f"Generated config: {out_file.relative_to(CONFIG_BASE)}")
+            for v_code, v_info in VARIANTS.items():
+                cfg = {
+                    "experiment_id": f"{wm.upper()}_{model_name.upper()}_{v_code.upper()}",
+                    "weather_model": wm,
+                    "model_name": model_name,
+                    "ablation_variant": v_code,
+                    "variant_description": f"[{wm.upper()}] " + v_info["desc"],
+                    "data": {
+                        "train_years": [2021, 2022, 2023, 2024],
+                        "val_years": [2024],
+                        "frozen_test_year": 2025,
+                        "target_column": "target_bias",
+                        "nwp_rain_column": f"nwp_rain_{wm}" if wm != "ecmwf_ifs" else "nwp_rain_raw",
+                    },
+                    **m_info
+                }
+                
+                out_file = m_dir / f"{wm}_{model_name}_{v_code}.yaml"
+                with open(out_file, "w", encoding="utf-8") as f:
+                    yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+                
+                # Default alias for ecmwf_ifs
+                if wm == "ecmwf_ifs":
+                    compat_file = m_dir / f"{model_name}_{v_code}.yaml"
+                    with open(compat_file, "w", encoding="utf-8") as f:
+                        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+                print(f"Generated config: {out_file.relative_to(CONFIG_BASE)}")
 
 if __name__ == "__main__":
     generate_configs()
