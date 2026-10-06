@@ -42,3 +42,7 @@ data/nwp_forecasts/*
 !data/nwp_forecasts/.gitkeep
 data/himawari9/*
 !data/himawari9/.gitkeep
+data/geo/*
+!data/geo/.gitkeep
+data/features/*
+!data/features/.gitkeep
