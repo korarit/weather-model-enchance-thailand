@@ -1,0 +1,1 @@
+﻿station_code,variable_type,total_expected_hours,actual_hours_reported,missing_timestamp_hours,explicit_null_hours,sentinel_error_hours,flag_error_hours,out_of_bounds_hours,valid_hours,completeness_pct,max_consecutive_gap_hours,tier,is_golden,catalog,months_analyzed,station_name,basin_name,province_name,amphoe_name,latitude,longitude

@@ -1,0 +1,6 @@
+﻿station_code,all_three_golden,all_three_silver_or_better,min_completeness_pct,avg_completeness_pct,hourly_rain_tier,hourly_rain_completeness_pct,pressure_tier,pressure_completeness_pct,humidity_tier,humidity_completeness_pct,station_name,basin_name,province_name,amphoe_name,latitude,longitude
+ACRU,False,False,98.3959,98.8385,Tier 3: Bronze,99.7193,Tier 3: Bronze,98.4004,Tier 3: Bronze,98.3959,ทต.ไก่คำ,มูล,อำนาจเจริญ,เมืองอำนาจเจริญ,15.788054,104.642235
+ATG011,False,False,62.1417,85.5726,Tier 3: Bronze,97.4192,Tier 4: Excluded,62.1417,Tier 3: Bronze,97.1568,ปตร.พลเทพ,เจ้าพระยา,ชัยนาท,เมืองชัยนาท,15.21593,100.07282
+ATG021,False,False,39.9986,57.9811,Tier 4: Excluded,77.5465,Tier 4: Excluded,39.9986,Tier 4: Excluded,56.3983,เหนือ ปตร.มโนรมย์,เจ้าพระยา,ชัยนาท,มโนรมย์,15.33047,100.103325
+ATG032,False,False,50.2099,81.1633,Tier 3: Bronze,97.782,Tier 4: Excluded,50.2099,Tier 3: Bronze,95.4979,ท้ายปตร.บรมธาตุ,เจ้าพระยา,ชัยนาท,เมืองชัยนาท,15.157781,100.152824
+ATG042,False,False,97.9212,97.9243,Tier 3: Bronze,97.9281,Tier 3: Bronze,97.9212,Tier 3: Bronze,97.9235,ท้ายปตร.มะขามเฒ่า-อู่ทอง,ท่าจีน,ชัยนาท,วัดสิงห์,15.222314,100.06234
