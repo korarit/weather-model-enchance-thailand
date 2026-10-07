@@ -90,6 +90,19 @@ def check_cds_configured(key: Optional[str] = None) -> bool:
     return False
 
 
+def resolve_forecast_type_for_origin(origin: str, requested_type: str) -> str:
+    """
+    DWD ICON submits its single deterministic forecast as 'high_resolution_forecast'
+    in TIGGE, whereas other centers submit as 'control_forecast'.
+    This automatically maps 'control_forecast' -> 'high_resolution_forecast' for DWD.
+    """
+    cds_origin = CDS_ORIGIN_MAP.get(origin.lower(), origin.lower())
+    if cds_origin == "dwd" and requested_type == "control_forecast":
+        logger.info("Automatically mapping forecast_type to 'high_resolution_forecast' for DWD (%s)", origin)
+        return "high_resolution_forecast"
+    return requested_type
+
+
 def build_tigge_request(
     origin: str,
     date_str: str,
@@ -105,6 +118,7 @@ def build_tigge_request(
     cds_origin = CDS_ORIGIN_MAP.get(origin.lower(), origin.lower())
     dt = pd.Timestamp(date_str)
     time_str = cycle if ":" in cycle else f"{int(cycle):02d}:00"
+    resolved_fc_type = resolve_forecast_type_for_origin(origin, forecast_type)
 
     var_list = variables or TIGGE_VARIABLES
     var_clean = []
@@ -124,7 +138,7 @@ def build_tigge_request(
         "time": time_str,
         "level_type": "single_level",
         "variable": var_clean,
-        "forecast_type": forecast_type,
+        "forecast_type": resolved_fc_type,
         "leadtime_hour": [str(int(s)) for s in steps],
         "data_format": "grib",
         "area": area,
@@ -252,8 +266,15 @@ class CDSRestClient:
                 time.sleep(sleep)
                 sleep = min(sleep * 1.5, max_sleep)
             elif status in ("failed", "rejected", "dismissed"):
-                detail = poll_data.get("detail") or poll_data.get("title") or poll_data
-                raise RuntimeError(f"CDS Job [{job_id}] failed with status '{status}': {detail}")
+                error_detail = poll_data.get("detail") or poll_data.get("title")
+                if not error_detail:
+                    try:
+                        results_url = f"{monitor_url.rstrip('/')}/results"
+                        err_resp = self.session.get(results_url, headers=self.headers, timeout=15)
+                        error_detail = err_resp.json()
+                    except Exception:
+                        error_detail = poll_data
+                raise RuntimeError(f"CDS Job [{job_id}] failed with status '{status}': {error_detail}")
             else:
                 logger.debug("Job status [%s], waiting %.1fs", status, sleep)
                 time.sleep(sleep)
@@ -372,6 +393,7 @@ def build_tigge_monthly_request(
     """
     cds_origin = CDS_ORIGIN_MAP.get(origin.lower(), origin.lower())
     time_list = [c if ":" in c else f"{int(c):02d}:00" for c in cycles]
+    resolved_fc_type = resolve_forecast_type_for_origin(origin, forecast_type)
 
     var_list = variables or TIGGE_VARIABLES
     var_clean = []
@@ -391,7 +413,7 @@ def build_tigge_monthly_request(
         "time": time_list,
         "level_type": "single_level",
         "variable": var_clean,
-        "forecast_type": forecast_type,
+        "forecast_type": resolved_fc_type,
         "leadtime_hour": [str(int(s)) for s in steps],
         "data_format": "grib",
         "area": area,
