@@ -183,13 +183,16 @@ class CDSRestClient:
 
         target_file.parent.mkdir(parents=True, exist_ok=True)
 
-        endpoints = [
-            f"{self.url}/retrieve/v1/processes/{dataset}/execution",
-        ]
-        if "cds.climate.copernicus.eu" in self.url:
+        endpoints = []
+        if "tigge" in dataset.lower():
+            # TIGGE is archived on ECMWF Climate Data Store (ECDS)
             endpoints.append(f"https://ecds.ecmwf.int/api/retrieve/v1/processes/{dataset}/execution")
-        elif "ecds.ecmwf.int" in self.url:
-            endpoints.append(f"https://cds.climate.copernicus.eu/api/retrieve/v1/processes/{dataset}/execution")
+            if "ecds.ecmwf.int" not in self.url:
+                endpoints.append(f"{self.url}/retrieve/v1/processes/{dataset}/execution")
+        else:
+            endpoints.append(f"{self.url}/retrieve/v1/processes/{dataset}/execution")
+            if "cds.climate.copernicus.eu" in self.url:
+                endpoints.append(f"https://ecds.ecmwf.int/api/retrieve/v1/processes/{dataset}/execution")
 
         exec_resp = None
         last_error = None
@@ -212,18 +215,25 @@ class CDSRestClient:
         job_info = exec_resp.json()
         job_id = job_info.get("jobID")
 
+        # Determine job monitoring URL (must NOT be the POST execution endpoint)
         monitor_url = None
         for link in job_info.get("links", []):
-            if link.get("rel") in ("monitor", "status", "self"):
-                monitor_url = link.get("href")
+            rel = link.get("rel")
+            href = link.get("href", "")
+            if rel in ("monitor", "status") and not href.endswith("/execution"):
+                monitor_url = href
                 break
+
         if not monitor_url and job_id:
-            monitor_url = urllib.parse.urljoin(exec_resp.url, f"../../jobs/{job_id}")
+            # Correctly construct OGC API jobs endpoint: {base_prefix}/jobs/{job_id}
+            parsed = urllib.parse.urlparse(exec_resp.url)
+            base_prefix = parsed.path.split("/processes")[0]
+            monitor_url = f"{parsed.scheme}://{parsed.netloc}{base_prefix}/jobs/{job_id}"
 
         if not monitor_url:
             raise RuntimeError(f"Could not determine job monitor URL from response: {job_info}")
 
-        logger.info("CDS Job submitted successfully (ID: %s). Monitoring status...", job_id)
+        logger.info("CDS Job submitted successfully (ID: %s). Monitoring status at %s...", job_id, monitor_url)
 
         # Poll status
         sleep = 2.0
