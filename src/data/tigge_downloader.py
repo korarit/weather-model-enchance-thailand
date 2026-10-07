@@ -1,20 +1,7 @@
-"""
-TIGGE Global NWP Forecasts Acquisition Module (ECDS / Copernicus CDS)
-Supports 6 World NWP Centers:
-- ecmf: ECMWF IFS
-- kwbc: NOAA NCEP GFS
-- cwao: CMC GEM Global
-- ammc: BoM ACCESS-G
-- edzw: DWD ICON Global
-- lfpw: Météo-France ARPEGE
-
-Spatial Domain: Thailand Bounding Box [21.0, 97.0, 5.0, 106.0]
-Cycles: 00:00, 12:00 UTC
-Steps: 6, 12, 18, 24, 30, 36, 42, 48 hours
-"""
-
 import os
 import sys
+import time
+import urllib.parse
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -23,10 +10,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import argparse
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import datetime
 import numpy as np
 import pandas as pd
+import requests
 
 from src.config.paths import (
     DEFAULT_RAW_NWP_DIR,
@@ -37,14 +25,40 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 DEFAULT_RAW_DIR = DEFAULT_RAW_NWP_DIR
+DEFAULT_CDS_URL = "https://cds.climate.copernicus.eu/api"
 
 TIGGE_ORIGINS = {
     "ecmf": "ECMWF IFS (Europe)",
+    "ecmwf": "ECMWF IFS (Europe)",
     "kwbc": "NOAA NCEP GFS (USA)",
+    "ncep": "NOAA NCEP GFS (USA)",
     "cwao": "CMC GEM Global (Canada)",
+    "cmc": "CMC GEM Global (Canada)",
+    "eccc": "CMC GEM Global (Canada)",
     "ammc": "BoM ACCESS-G (Australia)",
+    "bom": "BoM ACCESS-G (Australia)",
     "edzw": "DWD ICON Global (Germany)",
+    "dwd": "DWD ICON Global (Germany)",
     "lfpw": "Météo-France ARPEGE (France)",
+    "mf": "Météo-France ARPEGE (France)",
+    "meteo_france": "Météo-France ARPEGE (France)",
+}
+
+CDS_ORIGIN_MAP = {
+    "ecmf": "ecmwf",
+    "ecmwf": "ecmwf",
+    "kwbc": "ncep",
+    "ncep": "ncep",
+    "cwao": "eccc",
+    "cmc": "eccc",
+    "eccc": "eccc",
+    "ammc": "bom",
+    "bom": "bom",
+    "edzw": "dwd",
+    "dwd": "dwd",
+    "lfpw": "mf",
+    "mf": "mf",
+    "meteo_france": "mf",
 }
 
 # Thailand Bounding Box [North, West, South, East]
@@ -56,19 +70,22 @@ LEAD_STEPS = ["6", "12", "18", "24", "30", "36", "42", "48"]
 TIGGE_VARIABLES = [
     "total_precipitation",
     "surface_pressure",
-    "2m_temperature",
-    "10m_u_component_of_wind",
-    "10m_v_component_of_wind",
+    "2_m_temperature",
+    "10_m_u_component_of_wind",
+    "10_m_v_component_of_wind",
     "convective_available_potential_energy",
+    "total_column_water",
 ]
 
 
-def check_cds_configured() -> bool:
-    """Checks whether .cdsapirc or environment variable CDSAPI_KEY is configured."""
+def check_cds_configured(key: Optional[str] = None) -> bool:
+    """Checks whether CDS key is configured via argument, environment variable, or ~/.cdsapirc."""
+    if key:
+        return True
+    if os.environ.get("CDSAPI_KEY"):
+        return True
     home_rc = Path.home() / ".cdsapirc"
     if home_rc.exists():
-        return True
-    if os.environ.get("CDSAPI_KEY") and os.environ.get("CDSAPI_URL"):
         return True
     return False
 
@@ -78,19 +95,187 @@ def build_tigge_request(
     date_str: str,
     cycle: str,
     steps: List[str] = LEAD_STEPS,
-    area: List[float] = THAILAND_BBOX
+    area: List[float] = THAILAND_BBOX,
+    forecast_type: str = "control_forecast",
+    variables: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Constructs API payload for TIGGE request via cdsapi."""
-    return {
-        "origin": origin,
-        "variable": TIGGE_VARIABLES,
-        "date": date_str,
-        "time": cycle,
-        "step": steps,
-        "area": area,
-        "type": "control",
-        "format": "grib",
+    """
+    Constructs API payload for modern Copernicus CDS dataset 'tigge-forecasts'.
+    """
+    cds_origin = CDS_ORIGIN_MAP.get(origin.lower(), origin.lower())
+    dt = pd.Timestamp(date_str)
+    time_str = cycle if ":" in cycle else f"{int(cycle):02d}:00"
+
+    var_list = variables or TIGGE_VARIABLES
+    var_clean = []
+    var_fix = {
+        "2m_temperature": "2_m_temperature",
+        "10m_u_component_of_wind": "10_m_u_component_of_wind",
+        "10m_v_component_of_wind": "10_m_v_component_of_wind",
     }
+    for v in var_list:
+        var_clean.append(var_fix.get(v, v))
+
+    return {
+        "origin": cds_origin,
+        "year": f"{dt.year:04d}",
+        "month": f"{dt.month:02d}",
+        "day": f"{dt.day:02d}",
+        "time": time_str,
+        "level_type": "single_level",
+        "variable": var_clean,
+        "forecast_type": forecast_type,
+        "leadtime_hour": [str(int(s)) for s in steps],
+        "data_format": "grib",
+        "area": area,
+    }
+
+
+class CDSRestClient:
+    """
+    Direct REST API client for Copernicus / ECMWF Data Store.
+    Implements OGC API - Processes retrieval natively via `requests` without `cdsapi`.
+    """
+    def __init__(self, key: Optional[str] = None, url: Optional[str] = None):
+        self.url, self.key = self._resolve_credentials(url, key)
+        self.session = requests.Session()
+        self.headers = {
+            "User-Agent": "weather-forecast-enhance/1.0",
+        }
+        if self.key:
+            if ":" in self.key:
+                uid, secret = self.key.split(":", 1)
+                self.session.auth = (uid.strip(), secret.strip())
+            else:
+                self.headers["PRIVATE-TOKEN"] = self.key.strip()
+
+    @staticmethod
+    def _resolve_credentials(url: Optional[str], key: Optional[str]) -> Tuple[str, Optional[str]]:
+        if not key:
+            key = os.environ.get("CDSAPI_KEY")
+        if not url:
+            url = os.environ.get("CDSAPI_URL")
+
+        if not key or not url:
+            dotrc = os.environ.get("CDSAPI_RC", Path.home() / ".cdsapirc")
+            if Path(dotrc).exists():
+                try:
+                    with open(dotrc, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if ":" in line:
+                                k, v = line.strip().split(":", 1)
+                                k = k.strip().lower()
+                                v = v.strip()
+                                if k == "key" and not key:
+                                    key = v
+                                elif k == "url" and not url:
+                                    url = v
+                except Exception as e:
+                    logger.debug("Failed parsing %s: %s", dotrc, e)
+
+        final_url = url or DEFAULT_CDS_URL
+        return final_url.rstrip("/"), key
+
+    def retrieve(self, dataset: str, request_params: Dict[str, Any], target_file: Path) -> Path:
+        """Submits an asynchronous process execution job, polls until complete, and downloads GRIB."""
+        if not self.key:
+            raise ValueError("No CDS credentials provided. Please supply --key or configure CDSAPI_KEY / ~/.cdsapirc.")
+
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+
+        endpoints = [
+            f"{self.url}/retrieve/v1/processes/{dataset}/execution",
+        ]
+        if "cds.climate.copernicus.eu" in self.url:
+            endpoints.append(f"https://ecds.ecmwf.int/api/retrieve/v1/processes/{dataset}/execution")
+        elif "ecds.ecmwf.int" in self.url:
+            endpoints.append(f"https://cds.climate.copernicus.eu/api/retrieve/v1/processes/{dataset}/execution")
+
+        exec_resp = None
+        last_error = None
+        for ep in endpoints:
+            try:
+                logger.info("Submitting CDS retrieval job to %s...", ep)
+                r = self.session.post(ep, json={"inputs": request_params}, headers=self.headers, timeout=60)
+                if r.status_code == 404:
+                    logger.warning("Dataset '%s' not found on %s (HTTP 404). Trying fallback endpoint...", dataset, ep)
+                    continue
+                r.raise_for_status()
+                exec_resp = r
+                break
+            except Exception as e:
+                last_error = e
+
+        if exec_resp is None:
+            raise RuntimeError(f"Failed to submit CDS retrieval job: {last_error}")
+
+        job_info = exec_resp.json()
+        job_id = job_info.get("jobID")
+
+        monitor_url = None
+        for link in job_info.get("links", []):
+            if link.get("rel") in ("monitor", "status", "self"):
+                monitor_url = link.get("href")
+                break
+        if not monitor_url and job_id:
+            monitor_url = urllib.parse.urljoin(exec_resp.url, f"../../jobs/{job_id}")
+
+        if not monitor_url:
+            raise RuntimeError(f"Could not determine job monitor URL from response: {job_info}")
+
+        logger.info("CDS Job submitted successfully (ID: %s). Monitoring status...", job_id)
+
+        # Poll status
+        sleep = 2.0
+        max_sleep = 30.0
+        while True:
+            poll_resp = self.session.get(monitor_url, headers=self.headers, timeout=60)
+            poll_resp.raise_for_status()
+            poll_data = poll_resp.json()
+            status = poll_data.get("status")
+
+            if status == "successful":
+                logger.info("CDS Job [%s] completed successfully!", job_id)
+                break
+            elif status in ("accepted", "running"):
+                logger.info("CDS Job [%s] is %s... waiting %.1fs", job_id, status, sleep)
+                time.sleep(sleep)
+                sleep = min(sleep * 1.5, max_sleep)
+            elif status in ("failed", "rejected", "dismissed"):
+                detail = poll_data.get("detail") or poll_data.get("title") or poll_data
+                raise RuntimeError(f"CDS Job [{job_id}] failed with status '{status}': {detail}")
+            else:
+                logger.debug("Job status [%s], waiting %.1fs", status, sleep)
+                time.sleep(sleep)
+
+        # Get results
+        results_url = None
+        for link in poll_data.get("links", []):
+            if link.get("rel") == "results":
+                results_url = link.get("href")
+                break
+        if not results_url:
+            results_url = f"{monitor_url.rstrip('/')}/results"
+
+        res_resp = self.session.get(results_url, headers=self.headers, timeout=60)
+        res_resp.raise_for_status()
+        asset = res_resp.json().get("asset", {}).get("value", {})
+        download_href = asset.get("href")
+        if not download_href:
+            raise RuntimeError(f"No downloadable asset link found in results: {res_resp.text}")
+
+        download_url = urllib.parse.urljoin(results_url, download_href)
+        logger.info("Downloading GRIB from %s to %s...", download_url, target_file)
+
+        with self.session.get(download_url, headers=self.headers, stream=True, timeout=300) as stream_resp:
+            stream_resp.raise_for_status()
+            with open(target_file, "wb") as f:
+                for chunk in stream_resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+
+        logger.info("Downloaded %s successfully (%d bytes)", target_file, target_file.stat().st_size)
+        return target_file
 
 
 def generate_synthetic_nwp_payload(
@@ -165,10 +350,14 @@ def download_tigge_cycle(
     date_str: str,
     cycle: str,
     output_dir: Path = DEFAULT_RAW_DIR,
-    use_synthetic_fallback: bool = True
+    use_synthetic_fallback: bool = True,
+    forecast_type: str = "control_forecast",
+    dataset: str = "tigge-forecasts",
+    key: Optional[str] = None,
+    url: str = DEFAULT_CDS_URL,
 ) -> Path:
     """
-    Downloads or retrieves one NWP forecast cycle.
+    Downloads or retrieves one NWP forecast cycle via direct CDS/ECDS REST API.
     If CDS credentials are not present or error occurs, uses synthetic fallback in dev mode.
     """
     cycle_tag = cycle.replace(":", "")
@@ -181,19 +370,26 @@ def download_tigge_cycle(
         logger.info("Found cached GRIB file: %s", target_grib)
         return target_grib
 
-    if check_cds_configured():
+    if check_cds_configured(key):
         try:
-            import cdsapi
-            client = cdsapi.Client(url="https://ecds.ecmwf.int/api")
-            request_payload = build_tigge_request(origin, date_str, cycle)
-            logger.info("Sending TIGGE request to ECDS: %s %s %s", origin, date_str, cycle)
-            client.retrieve("tigge", request_payload, str(target_grib))
-            logger.info("Downloaded TIGGE GRIB to %s", target_grib)
+            client = CDSRestClient(url=url, key=key)
+            request_payload = build_tigge_request(
+                origin=origin,
+                date_str=date_str,
+                cycle=cycle,
+                forecast_type=forecast_type,
+            )
+            logger.info("Retrieving from CDS API (%s): dataset='%s', origin='%s', date='%s', cycle='%s'",
+                        client.url, dataset, request_payload.get("origin"), date_str, cycle)
+            client.retrieve(dataset, request_payload, target_grib)
+            logger.info("Successfully downloaded TIGGE GRIB to %s", target_grib)
             return target_grib
         except Exception as e:
-            logger.warning("CDS download failed for %s (%s). Fallback triggered: %s", origin, date_str, e)
+            logger.warning("CDS download failed for %s (%s %s). Fallback triggered: %s", origin, date_str, cycle, e)
             if not use_synthetic_fallback:
                 raise e
+    else:
+        logger.info("No CDS credentials found (--key, ~/.cdsapirc or CDSAPI_KEY). Using synthetic fallback.")
 
     # Fallback to dev synthetic generator
     logger.info("Generating dev sample NWP dataset for %s (%s %s)", origin, date_str, cycle)
@@ -204,7 +400,11 @@ def run_batch_acquisition(
     dates: List[str],
     origins: List[str],
     cycles: List[str] = FORECAST_CYCLES,
-    output_dir: Path = DEFAULT_RAW_DIR
+    output_dir: Path = DEFAULT_RAW_DIR,
+    use_synthetic_fallback: bool = True,
+    forecast_type: str = "control_forecast",
+    key: Optional[str] = None,
+    url: str = DEFAULT_CDS_URL,
 ) -> List[Path]:
     """Runs batch NWP forecast cycle acquisition across dates and origins."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -220,20 +420,33 @@ def run_batch_acquisition(
                 pct = (completed / total_tasks) * 100
                 logger.info("[NWP Progress: %d/%d (%.1f%%)] Fetching %s | Date: %s | Cycle: %s...",
                             completed, total_tasks, pct, orig, d, c)
-                p = download_tigge_cycle(orig, d, c, output_dir=output_dir, use_synthetic_fallback=True)
+                p = download_tigge_cycle(
+                    origin=orig,
+                    date_str=d,
+                    cycle=c,
+                    output_dir=output_dir,
+                    use_synthetic_fallback=use_synthetic_fallback,
+                    forecast_type=forecast_type,
+                    key=key,
+                    url=url,
+                )
                 output_files.append(p)
     logger.info("NWP Acquisition finished: %d/%d forecast files ready at %s", len(output_files), total_tasks, output_dir)
     return output_files
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TIGGE NWP Forecast Cycles Downloader")
+    parser = argparse.ArgumentParser(description="TIGGE NWP Forecast Cycles Downloader (Direct REST API)")
+    parser.add_argument("--key", type=str, default=None, help="Copernicus CDS API Key / Personal Access Token")
+    parser.add_argument("--url", type=str, default=DEFAULT_CDS_URL, help=f"Copernicus CDS API URL (default: {DEFAULT_CDS_URL})")
     parser.add_argument("--forecast-dir", "--nwp-dir", dest="forecast_dir", type=str, default=None, help="Base directory for NWP forecast data (e.g. E:/data/weather_nwp)")
     parser.add_argument("--output-dir", type=str, default=None, help="Output raw directory (default: {forecast-dir}/raw/nwp_runs or data/raw/nwp_runs)")
     parser.add_argument("--sample-days", type=int, default=2, help="Sample days for dev mode")
     parser.add_argument("--start", type=str, default="2021-01-01", help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
-    parser.add_argument("--origins", type=str, default="ecmf,kwbc", help="Comma-separated TIGGE origins (e.g. ecmf,kwbc,cwao)")
+    parser.add_argument("--origins", type=str, default="ecmf,kwbc", help="Comma-separated TIGGE origins (e.g. ecmf,kwbc,cwao or ecmwf,ncep)")
+    parser.add_argument("--forecast-type", type=str, default="control_forecast", choices=["control_forecast", "perturbed_forecast"], help="CDS forecast type")
+    parser.add_argument("--no-fallback", action="store_true", help="Raise error if CDS download fails instead of generating synthetic data")
     parser.add_argument("--full", action="store_true", help="Run full multi-year download (Server production)")
     args = parser.parse_args()
 
@@ -254,7 +467,15 @@ def main():
     else:
         days = pd.date_range(start_date, periods=args.sample_days, freq="D").strftime("%Y-%m-%d").tolist()
 
-    run_batch_acquisition(days, origin_list, output_dir=output_dir)
+    run_batch_acquisition(
+        dates=days,
+        origins=origin_list,
+        output_dir=output_dir,
+        use_synthetic_fallback=not args.no_fallback,
+        forecast_type=args.forecast_type,
+        key=args.key,
+        url=args.url,
+    )
 
 
 if __name__ == "__main__":

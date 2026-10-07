@@ -108,8 +108,12 @@ def process_raw_nwp_file(input_file: Path, output_base_dir: Path = DEFAULT_OUT_N
         clean_df = normalize_nwp_dataframe(df)
 
         # Extract origin and run time from filename or data
-        origin = clean_df["origin"].iloc[0] if "origin" in clean_df.columns else "unknown"
-        run_dt = clean_df["run_time"].iloc[0]
+        if "origin" in clean_df.columns and pd.notna(clean_df["origin"].iloc[0]):
+            origin = clean_df["origin"].iloc[0]
+        else:
+            origin = input_file.parent.name if input_file.parent.name != "raw_nwp_runs" else "ecmwf"
+            clean_df["origin"] = origin
+        run_dt = clean_df["run_time"].iloc[0] if "run_time" in clean_df.columns else pd.Timestamp.now()
         run_tag = run_dt.strftime("%Y%m%d_%Hz").lower()
 
         target_dir = output_base_dir / origin

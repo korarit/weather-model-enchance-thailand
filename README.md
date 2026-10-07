@@ -134,6 +134,7 @@ weather-forcast-enhance/
 │   │   ├── hii_metadata.py
 │   │   ├── hii_parser.py
 │   │   ├── himawari_extractor.py
+│   │   ├── tigge_downloader.py         # TIGGE NWP Direct REST Downloader (No cdsapi dependency, native CADS/ECDS API)
 │   │   └── tigge_extractor.py
 │   ├── features/                       # Phase 3: Spatial Grid & Multi-Modal Feature Builder
 │   │   ├── copernicus_dem.py           # Copernicus DEM 30m downloader & terrain gradient extractor
@@ -224,8 +225,21 @@ python src/data/hii_audit.py --hii-dir "D:/data/hii" --mode sample
 ##### ขั้นตอนที่ 4: ดาวน์โหลดและสกัดข้อมูลพยากรณ์อากาศโลก (NWP) และดาวเทียม
 (สามารถระบุ `--forecast-dir` ไปยังไดรฟ์อื่น เช่น `E:/data/nwp` ได้อย่างอิสระ):
 ```bash
-# 4.1 ดาวน์โหลดและแปลง NWP Forecast Cycles (ECMWF, NCEP GFS)
+# 4.1 ดาวน์โหลดและแปลง NWP Forecast Cycles (ECMWF IFS, NOAA NCEP GFS ฯลฯ)
+# ใช้ Direct REST API (ไม่ต้องติดตั้งหรือ import cdsapi, รองรับส่ง API Key ผ่าน CLI ได้โดยตรง)
+# โหมด Dev Sample (มี Auto-synthetic fallback หากยังไม่มี key):
 python src/data/tigge_downloader.py --forecast-dir "E:/data/nwp" --sample-days 2
+
+# โหมด Production (ใส่ CDS Personal Access Token และระบุศูนย์พยากรณ์):
+python src/data/tigge_downloader.py \
+  --forecast-dir "E:/data/nwp" \
+  --origins ecmwf,ncep \
+  --start 2021-01-01 --end 2021-01-05 \
+  --key "YOUR_COPERNICUS_CDS_API_KEY" \
+  --forecast-type control_forecast \
+  --no-fallback
+
+# สกัดและแปลงไฟล์ GRIB2 ดิบเป็น Analysis-Ready Parquet (คำนวณ Lead-Time, แปลงหน่วย, ผูก Grid ID):
 python src/data/tigge_extractor.py --forecast-dir "E:/data/nwp"
 
 # 4.2 สกัดฟีเจอร์การพัฒนาตัวของกลุ่มเมฆจากดาวเทียม Himawari-9
