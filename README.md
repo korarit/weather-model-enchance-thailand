@@ -133,7 +133,8 @@ weather-forcast-enhance/
 │   │   ├── hii_downloader.py
 │   │   ├── hii_metadata.py
 │   │   ├── hii_parser.py
-│   │   ├── himawari_extractor.py
+│   │   ├── himawari_aws_downloader.py  # NOAA AWS S3 Smart Downloader (H8 & H9 Thailand Segments 3,4,5 via satpy)
+│   │   ├── himawari_extractor.py       # Cloud Evolution & Cooling Rate Feature Extractor (--source aws_s3/synthetic)
 │   │   ├── tigge_downloader.py         # TIGGE NWP Direct REST Downloader (No cdsapi dependency, native CADS/ECDS API)
 │   │   └── tigge_extractor.py
 │   ├── features/                       # Phase 3: Spatial Grid & Multi-Modal Feature Builder
@@ -164,15 +165,18 @@ weather-forcast-enhance/
 
 ## 🚀 ขั้นตอนการติดตั้งและการรันระบบ (Step-by-Step Execution Guide)
 
-### 1. การเตรียมสภาพแวดล้อม (Environment Setup)
+### 1. การเตรียมสภาพแวดล้อมและการติดตั้งแพ็กเกจ (Environment Setup & Installation)
 แนะนำให้ใช้งาน Python 3.10+ บน Virtual Environment หรือ Conda:
 
 ```bash
 # Clone หรือเข้าสู่โฟลเดอร์ของโปรเจกต์
 cd weather-forcast-enhance
 
-# ติดตั้งแพ็กเกจที่จำเป็น
-pip install numpy pandas scipy matplotlib lightgbm catboost torch pyproj pyarrow pyyaml
+# ติดตั้งแพ็กเกจที่จำเป็นทั้งหมดผ่าน requirements.txt
+pip install -r requirements.txt
+
+# หรือติดตั้งแพ็กเกจหลักด้วยตนเอง:
+pip install numpy pandas scipy matplotlib lightgbm catboost torch pyproj pyarrow pyyaml requests boto3 satpy pyresample
 ```
 
 ---
@@ -242,8 +246,21 @@ python src/data/tigge_downloader.py \
 # สกัดและแปลงไฟล์ GRIB2 ดิบเป็น Analysis-Ready Parquet (คำนวณ Lead-Time, แปลงหน่วย, ผูก Grid ID):
 python src/data/tigge_extractor.py --forecast-dir "E:/data/nwp"
 
-# 4.2 สกัดฟีเจอร์การพัฒนาตัวของกลุ่มเมฆจากดาวเทียม Himawari-9
-python src/data/himawari_extractor.py --forecast-dir "E:/data/nwp" --sample-hours 6
+# 4.2 สกัดฟีเจอร์การพัฒนาตัวของกลุ่มเมฆจากดาวเทียม Himawari-8/9
+# รองรับดึงข้อมูลจริงจาก NOAA Open Data on AWS S3 (ครอบคลุมครบ 2021-2025):
+# - ปี 2021 ถึง 13 ธ.ค. 2022: ดึงจาก s3://noaa-himawari8/ (Himawari-8)
+# - 13 ธ.ค. 2022 เป็นต้นไป (2023, 2024, 2025): ดึงจาก s3://noaa-himawari9/ (Himawari-9)
+# - โหลดเฉพาะ Segment 3, 4, 5 ครอบคลุมพิกัดไทย (ลดขนาดจาก ~800 MB เหลือเพียง ~6-9 MB ต่อ Band)
+# - สกัดและ Calibrate ค่า Brightness Temperature (Kelvin) ของ B13 และ Water Vapor B08 ผ่าน Satpy
+
+# 1) ตรวจสอบความพร้อมของข้อมูลบน AWS S3 ตลอดปี 2021-2025:
+python src/data/himawari_extractor.py --check-coverage
+
+# 2) ดึงข้อมูลดาวเทียมจริงจาก AWS S3 และคำนวณ Convective Cooling Rate (delta_bt_30):
+python src/data/himawari_extractor.py --forecast-dir "E:/data/nwp" --source aws_s3 --start "2024-06-01 00:00:00" --sample-hours 6
+
+# 3) โหมด Synthetic Simulation (สำหรับ Offline Test หรือรันแบบเร็ว):
+python src/data/himawari_extractor.py --forecast-dir "E:/data/nwp" --source synthetic --sample-hours 6
 ```
 
 ##### ขั้นตอนที่ 5: สร้าง Master Grid 2 km และรวมฟีเจอร์เข้า Matrix (Multi-Modal Feature Assembly)
@@ -460,4 +477,5 @@ python src/evaluation/generate_benchmark_charts.py --dir outputs/benchmark_2025/
   * สถาบันสารสนเทศทรัพยากรน้ำ (องค์การมหาชน) - HII
   * กรมทรัพยากรน้ำ - DWR
   * European Centre for Medium-Range Weather Forecasts (ECMWF IFS / TIGGE)
-  * Japan Meteorological Agency (JMA Himawari-9 Geostationary Satellite)
+  * Japan Meteorological Agency (JMA Himawari-8 & Himawari-9 Geostationary Satellites)
+  * NOAA Open Data Dissemination (NODD) on AWS S3 (`noaa-himawari8`, `noaa-himawari9`, `copernicus-dem-30m`)
