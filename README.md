@@ -176,7 +176,10 @@ cd weather-forcast-enhance
 pip install -r requirements.txt
 
 # หรือติดตั้งแพ็กเกจหลักด้วยตนเอง:
-pip install numpy pandas scipy matplotlib lightgbm catboost torch pyproj pyarrow pyyaml requests boto3 satpy pyresample
+pip install numpy pandas scipy matplotlib lightgbm catboost torch pyproj pyarrow pyyaml requests boto3 satpy pyresample rasterio shapely xarray cfgrib eccodes
+
+# สำหรับระบบ Linux / Ubuntu / Google Colab (แนะนำติดตั้ง libeccodes เพื่อให้ xarray อ่าน GRIB2 ได้ราบรื่น):
+# sudo apt-get update && sudo apt-get install -y libeccodes-dev
 ```
 
 ---
