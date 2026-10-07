@@ -37,6 +37,18 @@ COLUMN_VARIABLE_MAP = {
 }
 
 
+def align_hii_timestamp_to_utc(dt_series: pd.Series) -> pd.Series:
+    """
+    Converts Thailand local time (ICT / UTC+7 / Asia/Bangkok) to UTC.
+    Guarantees strict temporal alignment with NWP (ECMWF/GFS) and Himawari-9 datasets.
+    Formula: UTC = ICT (Thai Local Time) - 7 Hours.
+    """
+    ts = pd.to_datetime(dt_series)
+    if hasattr(ts, "dt") and ts.dt.tz is not None:
+        return ts.dt.tz_convert("UTC").dt.tz_localize(None)
+    return ts - pd.Timedelta(hours=7)
+
+
 def detect_and_normalize_csv(
     content: bytes,
     station_code: str,
