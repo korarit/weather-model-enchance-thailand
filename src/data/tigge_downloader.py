@@ -245,8 +245,11 @@ def main():
         origin_list = ["ecmf", "kwbc"]
 
     start_date = pd.Timestamp(args.start)
-    if args.full and args.end:
+    if args.end:
         end_date = pd.Timestamp(args.end)
+        days = pd.date_range(start_date, end_date, freq="D").strftime("%Y-%m-%d").tolist()
+    elif args.full:
+        end_date = pd.Timestamp("2024-12-31")
         days = pd.date_range(start_date, end_date, freq="D").strftime("%Y-%m-%d").tolist()
     else:
         days = pd.date_range(start_date, periods=args.sample_days, freq="D").strftime("%Y-%m-%d").tolist()
