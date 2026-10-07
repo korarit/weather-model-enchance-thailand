@@ -219,12 +219,14 @@ class CDSRestClient:
         final_url = url or DEFAULT_CDS_URL
         return final_url.rstrip("/"), key
 
-    def retrieve(self, dataset: str, request_params: Dict[str, Any], target_file: Path) -> Path:
-        """Submits an asynchronous process execution job, polls until complete, and downloads GRIB."""
+    def submit_job(self, dataset: str, request_params: Dict[str, Any]) -> Tuple[str, str]:
+        """
+        Submits an asynchronous process execution job to CDS/ECDS.
+        Returns:
+            Tuple[str, str]: (job_id, monitor_url)
+        """
         if not self.key:
             raise ValueError("No CDS credentials provided. Please supply --key or configure CDSAPI_KEY / ~/.cdsapirc.")
-
-        target_file.parent.mkdir(parents=True, exist_ok=True)
 
         endpoints = []
         if "tigge" in dataset.lower():
@@ -239,18 +241,28 @@ class CDSRestClient:
 
         exec_resp = None
         last_error = None
-        for ep in endpoints:
-            try:
-                logger.info("Submitting CDS retrieval job to %s...", ep)
-                r = self.session.post(ep, json={"inputs": request_params}, headers=self.headers, timeout=60)
-                if r.status_code == 404:
-                    logger.warning("Dataset '%s' not found on %s (HTTP 404). Trying fallback endpoint...", dataset, ep)
-                    continue
-                r.raise_for_status()
-                exec_resp = r
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            for ep in endpoints:
+                try:
+                    logger.debug("Submitting CDS retrieval job to %s...", ep)
+                    r = self.session.post(ep, json={"inputs": request_params}, headers=self.headers, timeout=60)
+                    if r.status_code == 404:
+                        continue
+                    if r.status_code == 429:
+                        retry_after = int(r.headers.get("Retry-After", 5))
+                        logger.warning("CDS API Rate Limit (429) hit on %s. Backing off %ds...", ep, retry_after)
+                        time.sleep(retry_after)
+                        continue
+                    r.raise_for_status()
+                    exec_resp = r
+                    break
+                except Exception as e:
+                    last_error = e
+            if exec_resp is not None:
                 break
-            except Exception as e:
-                last_error = e
+            if attempt < max_attempts - 1:
+                time.sleep(2.0 * (attempt + 1))
 
         if exec_resp is None:
             raise RuntimeError(f"Failed to submit CDS retrieval job: {last_error}")
@@ -268,7 +280,6 @@ class CDSRestClient:
                 break
 
         if not monitor_url and job_id:
-            # Correctly construct OGC API jobs endpoint: {base_prefix}/jobs/{job_id}
             parsed = urllib.parse.urlparse(exec_resp.url)
             base_prefix = parsed.path.split("/processes")[0]
             monitor_url = f"{parsed.scheme}://{parsed.netloc}{base_prefix}/jobs/{job_id}"
@@ -276,47 +287,48 @@ class CDSRestClient:
         if not monitor_url:
             raise RuntimeError(f"Could not determine job monitor URL from response: {job_info}")
 
-        logger.info("CDS Job submitted successfully (ID: %s). Monitoring status at %s...", job_id, monitor_url)
+        return job_id, monitor_url
 
-        # Poll status
-        sleep = 2.0
-        max_sleep = 30.0
-        while True:
-            poll_resp = self.session.get(monitor_url, headers=self.headers, timeout=60)
-            poll_resp.raise_for_status()
-            poll_data = poll_resp.json()
-            status = poll_data.get("status")
+    def check_job_status(self, monitor_url: str, job_id: str) -> Tuple[str, Optional[str], Optional[Dict[str, Any]]]:
+        """
+        Polls the status of an ongoing CDS job.
+        Returns:
+            status (str): 'successful', 'running', 'accepted', 'failed', 'rejected', etc.
+            results_url (Optional[str]): Endpoint to retrieve output assets if successful.
+            poll_data (Optional[Dict[str, Any]]): Full JSON payload returned by status endpoint.
+        """
+        poll_resp = self.session.get(monitor_url, headers=self.headers, timeout=60)
+        poll_resp.raise_for_status()
+        poll_data = poll_resp.json()
+        status = poll_data.get("status", "unknown")
 
-            if status == "successful":
-                logger.info("CDS Job [%s] completed successfully!", job_id)
-                break
-            elif status in ("accepted", "running"):
-                logger.info("CDS Job [%s] is %s... waiting %.1fs", job_id, status, sleep)
-                time.sleep(sleep)
-                sleep = min(sleep * 1.5, max_sleep)
-            elif status in ("failed", "rejected", "dismissed"):
-                error_detail = poll_data.get("detail") or poll_data.get("title")
-                if not error_detail:
-                    try:
-                        results_url = f"{monitor_url.rstrip('/')}/results"
-                        err_resp = self.session.get(results_url, headers=self.headers, timeout=15)
-                        error_detail = err_resp.json()
-                    except Exception:
-                        error_detail = poll_data
-                raise RuntimeError(f"CDS Job [{job_id}] failed with status '{status}': {error_detail}")
-            else:
-                logger.debug("Job status [%s], waiting %.1fs", status, sleep)
-                time.sleep(sleep)
-
-        # Get results
         results_url = None
-        for link in poll_data.get("links", []):
-            if link.get("rel") == "results":
-                results_url = link.get("href")
-                break
-        if not results_url:
-            results_url = f"{monitor_url.rstrip('/')}/results"
+        if status == "successful":
+            for link in poll_data.get("links", []):
+                if link.get("rel") == "results":
+                    results_url = link.get("href")
+                    break
+            if not results_url:
+                results_url = f"{monitor_url.rstrip('/')}/results"
 
+        elif status in ("failed", "rejected", "dismissed"):
+            error_detail = poll_data.get("detail") or poll_data.get("title")
+            if not error_detail:
+                try:
+                    res_url = f"{monitor_url.rstrip('/')}/results"
+                    err_resp = self.session.get(res_url, headers=self.headers, timeout=15)
+                    error_detail = err_resp.json()
+                except Exception:
+                    error_detail = poll_data
+            poll_data["detail"] = error_detail
+
+        return status, results_url, poll_data
+
+    def download_result_file(self, results_url: str, target_file: Path) -> Path:
+        """
+        Downloads result asset from a successful job's results endpoint.
+        """
+        target_file.parent.mkdir(parents=True, exist_ok=True)
         res_resp = self.session.get(results_url, headers=self.headers, timeout=60)
         res_resp.raise_for_status()
         asset = res_resp.json().get("asset", {}).get("value", {})
@@ -336,6 +348,29 @@ class CDSRestClient:
 
         logger.info("Downloaded %s successfully (%d bytes)", target_file, target_file.stat().st_size)
         return target_file
+
+    def retrieve(self, dataset: str, request_params: Dict[str, Any], target_file: Path) -> Path:
+        """Submits an asynchronous process execution job, polls until complete, and downloads GRIB."""
+        job_id, monitor_url = self.submit_job(dataset, request_params)
+        logger.info("CDS Job submitted successfully (ID: %s). Monitoring status at %s...", job_id, monitor_url)
+
+        sleep = 2.0
+        max_sleep = 30.0
+        while True:
+            status, results_url, poll_data = self.check_job_status(monitor_url, job_id)
+            if status == "successful":
+                logger.info("CDS Job [%s] completed successfully!", job_id)
+                return self.download_result_file(results_url, target_file)
+            elif status in ("accepted", "running"):
+                logger.info("CDS Job [%s] is %s... waiting %.1fs", job_id, status, sleep)
+                time.sleep(sleep)
+                sleep = min(sleep * 1.5, max_sleep)
+            elif status in ("failed", "rejected", "dismissed"):
+                error_detail = poll_data.get("detail") if poll_data else status
+                raise RuntimeError(f"CDS Job [{job_id}] failed with status '{status}': {error_detail}")
+            else:
+                logger.debug("Job status [%s], waiting %.1fs", status, sleep)
+                time.sleep(sleep)
 
 
 def generate_synthetic_nwp_payload(
@@ -631,6 +666,24 @@ def download_tigge_month(
     return fallback_files
 
 
+def _generate_fallback_for_task(task: Dict[str, Any], output_dir: Path) -> List[Path]:
+    """Generates synthetic NWP payloads for a task when CDS download fails or credentials missing."""
+    files = []
+    if task["mode"] == "monthly":
+        orig = task["origin"]
+        year = task["year"]
+        month = task["month"]
+        for d_str in task["days"]:
+            date_full = f"{year}-{month}-{int(d_str):02d}"
+            for c in task["cycles"]:
+                p = generate_synthetic_nwp_payload(orig, date_full, c, LEAD_STEPS, output_dir)
+                files.append(p)
+    else:
+        p = generate_synthetic_nwp_payload(task["origin"], task["date"], task["cycle"], LEAD_STEPS, output_dir)
+        files.append(p)
+    return files
+
+
 def run_batch_acquisition(
     dates: List[str],
     origins: List[str],
@@ -641,17 +694,19 @@ def run_batch_acquisition(
     key: Optional[str] = None,
     url: str = DEFAULT_CDS_URL,
     batch_mode: str = "monthly",
+    concurrency: int = 10,
 ) -> List[Path]:
     """
     Runs batch NWP forecast cycle acquisition across dates and origins.
-    By default (batch_mode='monthly'), groups requests by calendar month,
-    drastically reducing CDS queue wait time from thousands of jobs to ~1 job per month.
+    Maintains an asynchronous active pool of up to `concurrency` (default: 10) jobs
+    submitted simultaneously to ECMWF/CDS supercomputer, polling status in a continuous loop.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    output_files: List[Path] = []
+    task_queue: List[Dict[str, Any]] = []
 
     if batch_mode == "monthly":
         from collections import defaultdict
-        # Group dates by (year, month) -> list of day strings
         months_map = defaultdict(list)
         for d in dates:
             dt = pd.Timestamp(d)
@@ -660,66 +715,191 @@ def run_batch_acquisition(
             d_str = f"{dt.day:02d}"
             months_map[(y_str, m_str)].append(d_str)
 
-        total_tasks = len(months_map) * len(origins)
-        logger.info("Starting NWP Acquisition (MONTHLY BATCH MODE): %d months, %d origins (Total: %d CDS Jobs)",
-                    len(months_map), len(origins), total_tasks)
-
-        output_files = []
-        completed = 0
         for (y_str, m_str), d_list in sorted(months_map.items()):
             for orig in origins:
-                completed += 1
-                pct = (completed / total_tasks) * 100
-                logger.info("[NWP Progress: %d/%d (%.1f%%)] Fetching %s | Month: %s-%s (%d days, %d cycles)...",
-                            completed, total_tasks, pct, orig, y_str, m_str, len(d_list), len(cycles))
-                files = download_tigge_month(
-                    origin=orig,
-                    year=y_str,
-                    month=m_str,
-                    days=d_list,
-                    cycles=cycles,
-                    output_dir=output_dir,
-                    use_synthetic_fallback=use_synthetic_fallback,
-                    forecast_type=forecast_type,
-                    key=key,
-                    url=url,
-                )
-                output_files.extend(files)
-        logger.info("NWP Monthly Acquisition finished: %d cycle files ready across %d months at %s",
-                    len(output_files), len(months_map), output_dir)
-        return output_files
+                target_dir = output_dir / orig
+                target_dir.mkdir(parents=True, exist_ok=True)
+                cached_files = []
+                all_cached = True
+                for d_str in d_list:
+                    date_full = f"{y_str}-{m_str}-{int(d_str):02d}"
+                    for c in cycles:
+                        c_tag = c.replace(":", "")[:2]
+                        run_tag = f"{date_full.replace('-', '')}_{c_tag}z"
+                        grib_f = target_dir / f"tigge_{orig}_{run_tag}.grib"
+                        pq_f = target_dir / f"run_{run_tag}_synthetic.parquet"
+                        if grib_f.exists():
+                            cached_files.append(grib_f)
+                        elif pq_f.exists():
+                            cached_files.append(pq_f)
+                        else:
+                            all_cached = False
+
+                if all_cached and cached_files:
+                    logger.info("Found cached cycles for %s %s-%s (%d files), skipping.", orig, y_str, m_str, len(cached_files))
+                    output_files.extend(cached_files)
+                else:
+                    month_tag = f"{y_str}{int(m_str):02d}"
+                    monthly_grib = target_dir / f"tigge_{orig}_{month_tag}_monthly.grib"
+                    req = build_tigge_monthly_request(
+                        origin=orig,
+                        year=y_str,
+                        month=m_str,
+                        days=d_list,
+                        cycles=cycles,
+                        forecast_type=forecast_type,
+                    )
+                    task_queue.append({
+                        "mode": "monthly",
+                        "origin": orig,
+                        "tag": f"{orig} {y_str}-{m_str}",
+                        "year": y_str,
+                        "month": m_str,
+                        "days": d_list,
+                        "cycles": cycles,
+                        "target_grib": monthly_grib,
+                        "req_payload": req,
+                    })
 
     else:
-        # Legacy daily cycle-by-cycle mode
-        total_tasks = len(dates) * len(origins) * len(cycles)
-        logger.info("Starting NWP Acquisition (DAILY MODE): %d dates, %d origins, %d cycles (Total: %d tasks)",
-                    len(dates), len(origins), len(cycles), total_tasks)
-        output_files = []
-        completed = 0
+        # Daily mode
         for d in dates:
             for orig in origins:
                 for c in cycles:
-                    completed += 1
-                    pct = (completed / total_tasks) * 100
-                    logger.info("[NWP Progress: %d/%d (%.1f%%)] Fetching %s | Date: %s | Cycle: %s...",
-                                completed, total_tasks, pct, orig, d, c)
-                    p = download_tigge_cycle(
-                        origin=orig,
-                        date_str=d,
-                        cycle=c,
-                        output_dir=output_dir,
-                        use_synthetic_fallback=use_synthetic_fallback,
-                        forecast_type=forecast_type,
-                        key=key,
-                        url=url,
-                    )
-                    output_files.append(p)
-        logger.info("NWP Acquisition finished: %d/%d forecast files ready at %s", len(output_files), total_tasks, output_dir)
+                    target_dir = output_dir / orig
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    c_tag = c.replace(":", "")[:2]
+                    run_tag = f"{d.replace('-', '')}_{c_tag}z"
+                    grib_f = target_dir / f"tigge_{orig}_{run_tag}.grib"
+                    pq_f = target_dir / f"run_{run_tag}_synthetic.parquet"
+                    if grib_f.exists():
+                        output_files.append(grib_f)
+                    elif pq_f.exists():
+                        output_files.append(pq_f)
+                    else:
+                        req = build_tigge_request(
+                            origin=orig,
+                            date_str=d,
+                            cycle=c,
+                            forecast_type=forecast_type,
+                        )
+                        task_queue.append({
+                            "mode": "daily",
+                            "origin": orig,
+                            "tag": f"{orig} {d} {c}",
+                            "date": d,
+                            "cycle": c,
+                            "target_grib": grib_f,
+                            "req_payload": req,
+                        })
+
+    if not task_queue:
+        logger.info("All requested forecast cycles are already cached locally. Acquisition complete.")
         return output_files
+
+    total_tasks = len(task_queue)
+    logger.info("Starting NWP Acquisition (%s mode): %d tasks to acquire across %d origins (Concurrent pool size: %d)",
+                batch_mode.upper(), total_tasks, len(origins), concurrency)
+
+    if not check_cds_configured(key):
+        logger.info("No CDS credentials found. Generating synthetic fallback datasets for %d tasks.", total_tasks)
+        for task in task_queue:
+            fb = _generate_fallback_for_task(task, output_dir)
+            output_files.extend(fb)
+        return output_files
+
+    # Execute with Asynchronous Concurrent Pool (submit up to N jobs, then poll in loop)
+    client = CDSRestClient(key=key, url=url)
+    active_jobs: Dict[str, Dict[str, Any]] = {}
+    completed_count = 0
+    poll_interval = 4.0
+    dataset = "tigge-forecasts"
+
+    while task_queue or active_jobs:
+        # Step 1: Fill active job slots up to concurrency limit
+        while len(active_jobs) < concurrency and task_queue:
+            task = task_queue.pop(0)
+            try:
+                job_id, monitor_url = client.submit_job(dataset, task["req_payload"])
+                task["job_id"] = job_id
+                task["monitor_url"] = monitor_url
+                active_jobs[job_id] = task
+                logger.info("[Submitted %d/%d active slots] Task '%s' -> CDS Job ID: %s",
+                            len(active_jobs), concurrency, task["tag"], job_id)
+                time.sleep(0.3)
+            except Exception as e:
+                logger.warning("Failed to submit CDS job for '%s': %s", task["tag"], e)
+                if not use_synthetic_fallback:
+                    raise e
+                fb = _generate_fallback_for_task(task, output_dir)
+                output_files.extend(fb)
+                completed_count += 1
+
+        if not active_jobs:
+            break
+
+        # Step 2: Sleep and poll all active jobs in loop
+        time.sleep(poll_interval)
+        finished_in_round = []
+
+        for job_id, task in list(active_jobs.items()):
+            try:
+                status, results_url, poll_data = client.check_job_status(task["monitor_url"], job_id)
+            except Exception as e:
+                logger.debug("Transient poll error on job [%s]: %s", job_id, e)
+                continue
+
+            if status == "successful":
+                logger.info("CDS Job [%s] completed for '%s'! Downloading results...", job_id, task["tag"])
+                try:
+                    target_grib = task["target_grib"]
+                    client.download_result_file(results_url, target_grib)
+                    if task["mode"] == "monthly":
+                        unpacked = unpack_monthly_grib(target_grib, output_dir, task["origin"])
+                        if target_grib.exists() and unpacked:
+                            target_grib.unlink()
+                        output_files.extend(unpacked)
+                    else:
+                        output_files.append(target_grib)
+                    completed_count += 1
+                    pct = (completed_count / total_tasks) * 100
+                    logger.info("[NWP Progress: %d/%d (%.1f%%)] Finished '%s'!", completed_count, total_tasks, pct, task["tag"])
+                except Exception as e:
+                    logger.error("Download failed for job [%s] ('%s'): %s", job_id, task["tag"], e)
+                    if not use_synthetic_fallback:
+                        raise e
+                    fb = _generate_fallback_for_task(task, output_dir)
+                    output_files.extend(fb)
+                    completed_count += 1
+                finished_in_round.append(job_id)
+
+            elif status in ("failed", "rejected", "dismissed"):
+                err_detail = poll_data.get("detail") if poll_data else status
+                logger.warning("CDS Job [%s] for '%s' failed with status '%s': %s",
+                               job_id, task["tag"], status, err_detail)
+                if not use_synthetic_fallback:
+                    raise RuntimeError(f"CDS Job [{job_id}] for '{task['tag']}' failed with status '{status}': {err_detail}")
+                fb = _generate_fallback_for_task(task, output_dir)
+                output_files.extend(fb)
+                completed_count += 1
+                finished_in_round.append(job_id)
+
+            elif status in ("running", "accepted"):
+                pass
+
+        for jid in finished_in_round:
+            del active_jobs[jid]
+
+        if active_jobs:
+            logger.info("[CDS Pool Check] Active Jobs: %d | Pending in Queue: %d | Completed: %d/%d",
+                        len(active_jobs), len(task_queue), completed_count, total_tasks)
+
+    logger.info("NWP Batch Acquisition finished: %d files ready at %s", len(output_files), output_dir)
+    return output_files
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TIGGE NWP Forecast Cycles Downloader (Direct REST API & Monthly Batch)")
+    parser = argparse.ArgumentParser(description="TIGGE NWP Forecast Cycles Downloader (Direct REST API & Concurrent Batch)")
     parser.add_argument("--key", type=str, default=None, help="Copernicus CDS API Key / Personal Access Token")
     parser.add_argument("--url", type=str, default=DEFAULT_CDS_URL, help=f"Copernicus CDS API URL (default: {DEFAULT_CDS_URL})")
     parser.add_argument("--forecast-dir", "--nwp-dir", dest="forecast_dir", type=str, default=None, help="Base directory for NWP forecast data (e.g. E:/data/weather_nwp)")
@@ -729,7 +909,8 @@ def main():
     parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
     parser.add_argument("--origins", type=str, default="ecmf,kwbc", help="Comma-separated TIGGE origins (e.g. ecmf,kwbc,cwao or ecmwf,ncep)")
     parser.add_argument("--forecast-type", type=str, default="control_forecast", choices=["control_forecast", "perturbed_forecast"], help="CDS forecast type")
-    parser.add_argument("--batch-by", type=str, default="month", choices=["month", "day"], help="Batch requests by 'month' (fastest, reduces queue jobs ~60x) or 'day'")
+    parser.add_argument("--batch-by", type=str, default="month", choices=["month", "day"], help="Batch requests by 'month' (fastest) or 'day'")
+    parser.add_argument("--concurrency", type=int, default=10, help="Maximum concurrent asynchronous jobs submitted to CDS (default: 10)")
     parser.add_argument("--no-fallback", action="store_true", help="Raise error if CDS download fails instead of generating synthetic data")
     parser.add_argument("--full", action="store_true", help="Run full multi-year download (Server production)")
     args = parser.parse_args()
@@ -760,6 +941,7 @@ def main():
         key=args.key,
         url=args.url,
         batch_mode="monthly" if args.batch_by == "month" else "daily",
+        concurrency=args.concurrency,
     )
 
 
