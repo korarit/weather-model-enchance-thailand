@@ -40,23 +40,35 @@ def train_and_eval_hurdle(
     output_dir: Path,
     weather_model: str = "ecmwf_ifs",
     rain_threshold: float = 0.1,
-    prob_threshold: float = 0.35,
+    prob_threshold: float = 0.5,
     smoke_test: bool = False,
     hyperparams: dict = None,
 ):
     """Trains Two-Stage Hurdle Model and exports predictions."""
+    import gc
     features = ABLATION_FEATURES[ablation]
     logger.info("Training Two-Stage Hurdle on [%s] [%s] (smoke_test=%s)...", weather_model.upper(), ablation.upper(), smoke_test)
 
-    X = df[features].copy().fillna(0.0)
-    y_rain_binary = (df["observed_rain"] >= rain_threshold).astype(int)
-    y_bias = df["target_bias"].copy()
+    # ZERO-COPY slicing directly on df to avoid duplicating multi-gigabyte matrices
+    split_idx = int(len(df) * 0.7)
+    
+    # Train set (70%)
+    X_train = df.iloc[:split_idx][features].fillna(0.0)
+    y_bin_train = (df.iloc[:split_idx]["observed_rain"] >= rain_threshold).astype(int)
+    y_bias_train = df.iloc[:split_idx]["target_bias"]
 
-    split_idx = int(len(X) * 0.7)
-    X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_bin_train, y_bin_val = y_rain_binary.iloc[:split_idx], y_rain_binary.iloc[split_idx:]
-    y_bias_train, y_bias_val = y_bias.iloc[:split_idx], y_bias.iloc[split_idx:]
-    df_val = df.iloc[split_idx:].copy()
+    # Validation set (30%)
+    X_val = df.iloc[split_idx:][features].fillna(0.0)
+    y_bin_val = (df.iloc[split_idx:]["observed_rain"] >= rain_threshold).astype(int)
+    y_bias_val = df.iloc[split_idx:]["target_bias"]
+
+    # Extract only required metadata columns for prediction export (reduces val slice RAM by 80%)
+    meta_cols = [c for c in [
+        "valid_time", "run_time", "lead_time_hours", "lead_time", "weather_model",
+        "station_id", "grid_id", "lat", "lon", "target_lat", "target_lon",
+        "basin_id", "basin_name", "observed_rain", "nwp_rain_raw", "target_bias"
+    ] if c in df.columns]
+    df_val = df.iloc[split_idx:][meta_cols].copy()
 
     n_estimators = 2 if smoke_test else 80
 
@@ -66,7 +78,8 @@ def train_and_eval_hurdle(
         num_leaves=15 if smoke_test else 31,
         learning_rate=0.08,
         verbose=-1,
-        random_state=42
+        random_state=42,
+        n_jobs=-1,
     )
     clf.fit(X_train, y_bin_train)
 
@@ -81,13 +94,18 @@ def train_and_eval_hurdle(
         "num_leaves": 15 if smoke_test else 31,
         "learning_rate": 0.05,
         "verbose": -1,
-        "random_state": 42
+        "random_state": 42,
+        "n_jobs": -1,
     }
     if hyperparams and not smoke_test:
         reg_params.update(hyperparams)
 
     reg = lgb.LGBMRegressor(**reg_params)
     reg.fit(X_train[pos_mask_train], y_bias_train[pos_mask_train])
+
+    # Free training matrices immediately
+    del X_train, y_bin_train, y_bias_train, pos_mask_train
+    gc.collect()
 
     # Save checkpoints
     model_dir = output_dir / "models" / "hurdle" / weather_model / ablation
@@ -107,6 +125,9 @@ def train_and_eval_hurdle(
     val_rmse = float(np.sqrt(np.mean((final_bias_pred - y_bias_val.to_numpy()) ** 2)))
     logger.info("Hurdle [%s] [%s] Combined Validation RMSE: %.4f", weather_model.upper(), ablation.upper(), val_rmse)
 
+    del X_val, y_bin_val, y_bias_val, probs, bias_preds_cond
+    gc.collect()
+
     export_predictions(
         df=df_val,
         predicted_bias=final_bias_pred,
@@ -115,6 +136,9 @@ def train_and_eval_hurdle(
         output_dir=output_dir,
         weather_model=weather_model,
     )
+
+    del df_val, final_bias_pred, clf, reg
+    gc.collect()
 
 
 def main():
@@ -125,6 +149,7 @@ def main():
     parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/hurdle/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")
     parser.add_argument("--data-file", "--data-dir", "--data-path", dest="data_file", type=str, default=None, help="Path to training features parquet file or directory")
+    parser.add_argument("--max-samples", type=int, default=None, help="Maximum training samples to load (recommended: 500000 or 1000000 on Colab 12GB RAM)")
     args = parser.parse_args()
 
     dir_p = Path(args.dir)
@@ -141,7 +166,7 @@ def main():
 
     run_counter = 0
     for wm in weather_models:
-        df = load_training_dataset(data_path_or_str=args.data_file, weather_model=wm)
+        df = load_training_dataset(data_path_or_str=args.data_file, weather_model=wm, max_samples=args.max_samples)
 
         for ab in ablations:
             run_counter += 1

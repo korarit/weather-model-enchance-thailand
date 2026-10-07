@@ -129,12 +129,19 @@ def train_and_eval_fpn(
     X_mat = df[features].copy().fillna(0.0).to_numpy(dtype=np.float32)
     y_vec = df["target_bias"].to_numpy(dtype=np.float32)
 
+    import gc
     split_idx = int(len(df) * 0.7)
-    X_train_t = torch.tensor(X_mat[:split_idx])
-    y_train_t = torch.tensor(y_vec[:split_idx])
-    X_val_t = torch.tensor(X_mat[split_idx:])
-    y_val_t = torch.tensor(y_vec[split_idx:])
-    df_val = df.iloc[split_idx:].copy()
+    X_train_t = torch.from_numpy(df.iloc[:split_idx][features].fillna(0.0).to_numpy(dtype=np.float32))
+    y_train_t = torch.from_numpy(df.iloc[:split_idx]["target_bias"].to_numpy(dtype=np.float32))
+    X_val_t = torch.from_numpy(df.iloc[split_idx:][features].fillna(0.0).to_numpy(dtype=np.float32))
+    y_val_t = torch.from_numpy(df.iloc[split_idx:]["target_bias"].to_numpy(dtype=np.float32))
+
+    meta_cols = [c for c in [
+        "valid_time", "run_time", "lead_time_hours", "lead_time", "weather_model",
+        "station_id", "grid_id", "lat", "lon", "target_lat", "target_lon",
+        "basin_id", "basin_name", "observed_rain", "nwp_rain_raw", "target_bias"
+    ] if c in df.columns]
+    df_val = df.iloc[split_idx:][meta_cols].copy()
 
     model = SpatialFPNModel(in_features=len(features), hidden_dim=16 if smoke_test else 32)
     criterion = nn.HuberLoss()
@@ -149,6 +156,10 @@ def train_and_eval_fpn(
         loss.backward()
         optimizer.step()
         logger.info("  -> [FPN Epoch %d/%d] Training Huber Loss: %.4f", ep, epochs, loss.item())
+
+    # Free training tensors
+    del X_train_t, y_train_t
+    gc.collect()
 
     # Save checkpoint
     model_dir = output_dir / "models" / "fpn" / weather_model / ablation
@@ -165,6 +176,9 @@ def train_and_eval_fpn(
     val_rmse = float(np.sqrt(np.mean((val_pred_bias - y_val_t.numpy()) ** 2)))
     logger.info("FPN [%s] [%s] Validation RMSE: %.4f", weather_model.upper(), ablation.upper(), val_rmse)
 
+    del X_val_t, y_val_t
+    gc.collect()
+
     export_predictions(
         df=df_val,
         predicted_bias=val_pred_bias,
@@ -173,6 +187,9 @@ def train_and_eval_fpn(
         output_dir=output_dir,
         weather_model=weather_model,
     )
+
+    del df_val, val_pred_bias, model
+    gc.collect()
 
 
 def main():
@@ -183,6 +200,7 @@ def main():
     parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/fpn/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")
     parser.add_argument("--data-file", "--data-dir", "--data-path", dest="data_file", type=str, default=None, help="Path to training features parquet file or directory")
+    parser.add_argument("--max-samples", type=int, default=None, help="Maximum training samples to load (recommended: 500000 or 1000000 on Colab 12GB RAM)")
     args = parser.parse_args()
 
     dir_p = Path(args.dir)
@@ -199,7 +217,7 @@ def main():
 
     run_counter = 0
     for wm in weather_models:
-        df = load_training_dataset(data_path_or_str=args.data_file, weather_model=wm)
+        df = load_training_dataset(data_path_or_str=args.data_file, weather_model=wm, max_samples=args.max_samples)
 
         for ab in ablations:
             run_counter += 1

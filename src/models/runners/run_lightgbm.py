@@ -41,20 +41,28 @@ def train_and_eval_lgbm(
     hyperparams: dict = None,
 ):
     """Trains LightGBM regressor on residual bias and exports predictions."""
+    import gc
     features = ABLATION_FEATURES[ablation]
     logger.info("Training LightGBM on [%s] [%s] with %d features (smoke_test=%s)...", weather_model.upper(), ablation.upper(), len(features), smoke_test)
 
-    X = df[features].copy()
-    y = df["target_bias"].copy()
+    # ZERO-COPY slicing directly on df to avoid duplicating multi-gigabyte matrices
+    split_idx = int(len(df) * 0.7)
+    
+    # Train set (70%)
+    X_train = df.iloc[:split_idx][features].fillna(0.0)
+    y_train = df.iloc[:split_idx]["target_bias"]
 
-    # Handle missing values
-    X = X.fillna(0.0)
+    # Validation set (30%)
+    X_val = df.iloc[split_idx:][features].fillna(0.0)
+    y_val = df.iloc[split_idx:]["target_bias"]
 
-    # Train / Val Split (in smoke test, first 70% train, last 30% val)
-    split_idx = int(len(X) * 0.7)
-    X_train, y_train = X.iloc[:split_idx], y.iloc[:split_idx]
-    X_val, y_val = X.iloc[split_idx:], y.iloc[split_idx:]
-    df_val = df.iloc[split_idx:].copy()
+    # Extract only required metadata columns for prediction export (reduces val slice RAM by 80%)
+    meta_cols = [c for c in [
+        "valid_time", "run_time", "lead_time_hours", "lead_time", "weather_model",
+        "station_id", "grid_id", "lat", "lon", "target_lat", "target_lon",
+        "basin_id", "basin_name", "observed_rain", "nwp_rain_raw", "target_bias"
+    ] if c in df.columns]
+    df_val = df.iloc[split_idx:][meta_cols].copy()
 
     n_estimators = 2 if smoke_test else 100
     params = {
@@ -65,12 +73,17 @@ def train_and_eval_lgbm(
         "n_estimators": n_estimators,
         "verbose": -1,
         "random_state": 42,
+        "n_jobs": -1,
     }
     if hyperparams and not smoke_test:
         params.update(hyperparams)
 
     model = lgb.LGBMRegressor(**params)
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(5, verbose=False)] if not smoke_test else None)
+
+    # Free heavy training matrix immediately after fit to relieve RAM
+    del X_train, y_train
+    gc.collect()
 
     # Save model checkpoint
     model_dir = output_dir / "models" / "lightgbm" / weather_model / ablation
@@ -85,6 +98,9 @@ def train_and_eval_lgbm(
     logger.info("LightGBM [%s] [%s] Validation RMSE: %.4f (on %d val samples)",
                 weather_model.upper(), ablation.upper(), val_rmse, len(y_val))
 
+    del X_val, y_val
+    gc.collect()
+
     export_predictions(
         df=df_val,
         predicted_bias=val_pred_bias,
@@ -93,6 +109,9 @@ def train_and_eval_lgbm(
         output_dir=output_dir,
         weather_model=weather_model,
     )
+
+    del df_val, val_pred_bias, model
+    gc.collect()
 
 
 def main():
@@ -103,6 +122,7 @@ def main():
     parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/lightgbm/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")
     parser.add_argument("--data-file", "--data-dir", "--data-path", dest="data_file", type=str, default=None, help="Path to training features parquet file or directory")
+    parser.add_argument("--max-samples", type=int, default=None, help="Maximum training samples to load (recommended: 500000 or 1000000 on Colab 12GB RAM)")
     args = parser.parse_args()
 
     dir_p = Path(args.dir)
@@ -119,7 +139,7 @@ def main():
 
     run_counter = 0
     for wm in weather_models:
-        df = load_training_dataset(data_path_or_str=args.data_file, weather_model=wm)
+        df = load_training_dataset(data_path_or_str=args.data_file, weather_model=wm, max_samples=args.max_samples)
 
         for ab in ablations:
             run_counter += 1

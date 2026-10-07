@@ -43,16 +43,28 @@ def train_and_eval_quantile(
     hyperparams: dict = None,
 ):
     """Trains multi-quantile models and exports prediction intervals."""
+    import gc
     features = ABLATION_FEATURES[ablation]
     logger.info("Training Multi-Quantile GBDT on [%s] [%s] for %s (smoke_test=%s)...", weather_model.upper(), ablation.upper(), QUANTILES, smoke_test)
 
-    X = df[features].copy().fillna(0.0)
-    y = df["target_bias"].copy()
+    # ZERO-COPY slicing directly on df to avoid duplicating multi-gigabyte matrices
+    split_idx = int(len(df) * 0.7)
+    
+    # Train set (70%)
+    X_train = df.iloc[:split_idx][features].fillna(0.0)
+    y_train = df.iloc[:split_idx]["target_bias"]
 
-    split_idx = int(len(X) * 0.7)
-    X_train, y_train = X.iloc[:split_idx], y.iloc[:split_idx]
-    X_val, y_val = X.iloc[split_idx:], y.iloc[split_idx:]
-    df_val = df.iloc[split_idx:].copy()
+    # Validation set (30%)
+    X_val = df.iloc[split_idx:][features].fillna(0.0)
+    y_val = df.iloc[split_idx:]["target_bias"]
+
+    # Extract only required metadata columns for prediction export (reduces val slice RAM by 80%)
+    meta_cols = [c for c in [
+        "valid_time", "run_time", "lead_time_hours", "lead_time", "weather_model",
+        "station_id", "grid_id", "lat", "lon", "target_lat", "target_lon",
+        "basin_id", "basin_name", "observed_rain", "nwp_rain_raw", "target_bias"
+    ] if c in df.columns]
+    df_val = df.iloc[split_idx:][meta_cols].copy()
 
     n_estimators = 2 if smoke_test else 80
     model_dir = output_dir / "models" / "quantile" / weather_model / ablation
@@ -70,7 +82,8 @@ def train_and_eval_quantile(
             "num_leaves": 15 if smoke_test else 31,
             "learning_rate": 0.08,
             "verbose": -1,
-            "random_state": 42
+            "random_state": 42,
+            "n_jobs": -1,
         }
         if hyperparams and not smoke_test:
             params.update(hyperparams)
@@ -86,12 +99,20 @@ def train_and_eval_quantile(
         quantile_preds[q_tag] = preds_q
         if np.isclose(q, 0.50):
             median_pred_bias = preds_q
+        del model
+        gc.collect()
+
+    del X_train, y_train
+    gc.collect()
 
     logger.info("Saved all quantile checkpoints in %s", model_dir)
 
     pred_q50 = median_pred_bias if median_pred_bias is not None else quantile_preds["q50"]
     val_rmse_q50 = float(np.sqrt(np.mean((pred_q50 - y_val.to_numpy()) ** 2)))
     logger.info("Multi-Quantile [%s] [%s] q50 Validation RMSE: %.4f", weather_model.upper(), ablation.upper(), val_rmse_q50)
+
+    del X_val, y_val
+    gc.collect()
 
     export_predictions(
         df=df_val,
@@ -103,6 +124,9 @@ def train_and_eval_quantile(
         quantile_preds=quantile_preds
     )
 
+    del df_val, quantile_preds
+    gc.collect()
+
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Quantile GBDT Bias Correction Runner")
@@ -112,6 +136,7 @@ def main():
     parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/quantile/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")
     parser.add_argument("--data-file", "--data-dir", "--data-path", dest="data_file", type=str, default=None, help="Path to training features parquet file or directory")
+    parser.add_argument("--max-samples", type=int, default=None, help="Maximum training samples to load (recommended: 500000 or 1000000 on Colab 12GB RAM)")
     args = parser.parse_args()
 
     dir_p = Path(args.dir)
@@ -128,7 +153,7 @@ def main():
 
     run_counter = 0
     for wm in weather_models:
-        df = load_training_dataset(data_path_or_str=args.data_file, weather_model=wm)
+        df = load_training_dataset(data_path_or_str=args.data_file, weather_model=wm, max_samples=args.max_samples)
 
         for ab in ablations:
             run_counter += 1

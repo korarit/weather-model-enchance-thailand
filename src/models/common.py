@@ -205,22 +205,34 @@ def resolve_lat_lon(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
     return lat, lon
 
 
-def standardize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+def standardize_dataframe_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
     """
     Standardizes coordinate and common metadata column names in training/validation DataFrames
     to ensure compatibility across feature generation pipelines, runners, and prediction exports.
     """
-    df = df.copy()
+    if not inplace:
+        df = df.copy()
+
     # Coordinates: ensure 'lat' and 'lon' as well as 'target_lat' and 'target_lon' exist
-    lat_s, lon_s = resolve_lat_lon(df)
-    if "lat" not in df.columns:
-        df["lat"] = lat_s
-    if "lon" not in df.columns:
-        df["lon"] = lon_s
-    if "target_lat" not in df.columns:
-        df["target_lat"] = lat_s
-    if "target_lon" not in df.columns:
-        df["target_lon"] = lon_s
+    if not (("lat" in df.columns or "target_lat" in df.columns) and ("lon" in df.columns or "target_lon" in df.columns)):
+        lat_s, lon_s = resolve_lat_lon(df)
+        if "lat" not in df.columns:
+            df["lat"] = lat_s
+        if "lon" not in df.columns:
+            df["lon"] = lon_s
+        if "target_lat" not in df.columns:
+            df["target_lat"] = lat_s
+        if "target_lon" not in df.columns:
+            df["target_lon"] = lon_s
+    else:
+        if "lat" not in df.columns and "target_lat" in df.columns:
+            df["lat"] = df["target_lat"]
+        elif "target_lat" not in df.columns and "lat" in df.columns:
+            df["target_lat"] = df["lat"]
+        if "lon" not in df.columns and "target_lon" in df.columns:
+            df["lon"] = df["target_lon"]
+        elif "target_lon" not in df.columns and "lon" in df.columns:
+            df["target_lon"] = df["lon"]
 
     # Lead time: ensure 'lead_time_hours' and 'lead_time'
     if "lead_time_hours" not in df.columns and "lead_time" in df.columns:
@@ -244,6 +256,7 @@ def standardize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["nwp_rain_raw"] = df["tp"]
 
     return df
+
 
 
 def export_predictions(
@@ -308,15 +321,23 @@ def export_predictions(
     csv_path = pred_dir / f"{weather_model}_{model_name}_{ablation}_pred.csv"
     parquet_path = pred_dir / f"{weather_model}_{model_name}_{ablation}_pred.parquet"
 
-    out_df.to_csv(csv_path, index=False)
     out_df.to_parquet(parquet_path, index=False, compression="snappy")
+    # Stream CSV export in chunks to prevent large RAM buffer allocation
+    out_df.to_csv(csv_path, index=False, chunksize=100000)
     
-    # Also save standard filename for backward compatibility
+    # Also save standard filename for backward compatibility without re-serializing
     compat_csv = pred_dir / f"{model_name}_{ablation}_pred.csv"
-    out_df.to_csv(compat_csv, index=False)
+    import shutil
+    shutil.copyfile(csv_path, compat_csv)
     
-    logger.info("Exported predictions for %s [%s] (%s): %s (%d rows)", weather_model, model_name, ablation, csv_path.name, len(out_df))
+    n_exported = len(out_df)
+    del out_df
+    import gc
+    gc.collect()
+
+    logger.info("Exported predictions for %s [%s] (%s): %s (%d rows)", weather_model, model_name, ablation, csv_path.name, n_exported)
     return csv_path, parquet_path
+
 
 
 def resolve_runner_execution_targets(
@@ -386,19 +407,24 @@ _LOADED_DATASET_CACHE: Dict[str, pd.DataFrame] = {}
 def load_training_dataset(
     data_path_or_str: Optional[Union[str, Path]] = None,
     weather_model: Optional[str] = "ecmwf_ifs",
+    max_samples: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Loads training dataset from a parquet file, directory, or falls back to smoke test data.
     - Single file: reads parquet directly.
     - Directory:
         1. Prefers 'training_features_combined.parquet' if present.
-        2. Otherwise finds all 'training_features_*.parquet' and concatenates.
+        2. Otherwise streams and concatenates files using PyArrow Dataset with pre-sampling and zero-copy chunking.
     - None:
         1. Checks DEFAULT_FEATURES_DIR for combined or cycle parquets.
         2. If not found, generates synthetic smoke test dataset.
     Enforces DWR blind test anti-leakage, 2025 frozen test year isolation,
     and schema column standardization.
+    Optimized for low RAM footprint (downcasts float64 to float32, converts repetitive objects to categories,
+    and prunes multi-cycle files before reading).
     """
+    import gc
+
     if data_path_or_str:
         p = Path(data_path_or_str)
         if not p.is_absolute() and not p.exists() and (PROJECT_ROOT / p).exists():
@@ -406,10 +432,15 @@ def load_training_dataset(
 
         assert_no_dwr_leakage(str(p))
 
-        cache_key = str(p.resolve())
+        cache_key = f"{p.resolve()}_{max_samples}"
         if cache_key in _LOADED_DATASET_CACHE:
             logger.info("Using cached in-memory dataset for %s (%d rows)", p.name, len(_LOADED_DATASET_CACHE[cache_key]))
             return _LOADED_DATASET_CACHE[cache_key]
+
+        # Purge older cached dataset to strictly prevent memory accumulation
+        if len(_LOADED_DATASET_CACHE) > 0 and cache_key not in _LOADED_DATASET_CACHE:
+            _LOADED_DATASET_CACHE.clear()
+            gc.collect()
 
         if p.is_dir():
             # Check for combined parquet first
@@ -431,9 +462,56 @@ def load_training_dataset(
                 if not train_files:
                     train_files = files
 
-                logger.info("Found %d parquet feature file(s) in %s. Merging...", len(train_files), p)
-                dfs = [pd.read_parquet(f) for f in train_files]
-                df = pd.concat(dfs, ignore_index=True)
+                # If max_samples is specified, pre-prune cycle files evenly across 2021-2024 BEFORE reading
+                if max_samples is not None and len(train_files) > 1:
+                    import pyarrow.parquet as pq
+                    rows_per_file = 4464
+                    try:
+                        rows_per_file = max(1, pq.read_metadata(train_files[0]).num_rows)
+                    except Exception:
+                        pass
+                    num_needed = min(len(train_files), max(1, int(np.ceil(max_samples / rows_per_file))))
+                    if num_needed < len(train_files):
+                        stride = max(1, len(train_files) // num_needed)
+                        selected_files = train_files[::stride][:num_needed]
+                        logger.info(
+                            "[Memory Optimization] Pre-sampling %d cycle files (stride=%d) across %d total cycles to satisfy max_samples=%d rows.",
+                            len(selected_files), stride, len(train_files), max_samples
+                        )
+                        train_files = selected_files
+
+                logger.info("Streaming %d parquet feature file(s) in %s via PyArrow Dataset...", len(train_files), p)
+                try:
+                    import pyarrow.dataset as ds
+                    dataset = ds.dataset([str(f) for f in train_files], format="parquet")
+                    filter_expr = None
+                    if "valid_time" in dataset.schema.names:
+                        filter_expr = ds.field("valid_time") < pd.Timestamp("2025-01-01")
+                    elif "run_time" in dataset.schema.names:
+                        filter_expr = ds.field("run_time") < pd.Timestamp("2025-01-01")
+
+                    scanner = dataset.scanner(filter=filter_expr)
+                    table = scanner.to_table()
+                    df = table.to_pandas(self_destruct=True)
+                    del table, dataset, scanner
+                    gc.collect()
+                except Exception as ex:
+                    logger.warning("PyArrow dataset scan failed (%s). Falling back to chunked read...", ex)
+                    chunk_size = 200
+                    chunk_dfs = []
+                    for i in range(0, len(train_files), chunk_size):
+                        batch = [pd.read_parquet(f) for f in train_files[i:i + chunk_size]]
+                        c_df = pd.concat(batch, ignore_index=True)
+                        for col in c_df.select_dtypes(include=["float64"]).columns:
+                            c_df[col] = c_df[col].astype(np.float32)
+                        for col in c_df.select_dtypes(include=["int64"]).columns:
+                            c_df[col] = c_df[col].astype(np.int32)
+                        chunk_dfs.append(c_df)
+                        del batch, c_df
+                        gc.collect()
+                    df = pd.concat(chunk_dfs, ignore_index=True)
+                    del chunk_dfs
+                    gc.collect()
         elif p.is_file():
             logger.info("Loading training features from file: %s", p)
             df = pd.read_parquet(p)
@@ -441,23 +519,42 @@ def load_training_dataset(
             raise FileNotFoundError(f"Feature dataset path not found: {p}")
 
         # Strict Test Set Isolation: Filter out any rows with valid_time or run_time in 2025
-        # (e.g. from 2024-12-31 forecast cycles predicting +24h into Jan 1, 2025)
         time_col = "valid_time" if "valid_time" in df.columns else ("run_time" if "run_time" in df.columns else "timestamp")
         if time_col in df.columns:
             vt = pd.to_datetime(df[time_col])
             mask_2025 = vt.dt.year >= 2025
             if mask_2025.any():
                 n_leaked = int(mask_2025.sum())
-                df = df[~mask_2025].copy()
+                df = df[~mask_2025].reset_index(drop=True)
                 logger.info(
                     "[Test Set Isolation] Excluded %d rows where %s >= 2025 "
                     "(keeping 2025 strictly frozen for Phase 5 out-of-time evaluation).",
                     n_leaked, time_col
                 )
+                del vt, mask_2025
+                gc.collect()
+
+        # Downcast float64 -> float32 and int64 -> int32 column-by-column to cut RAM by 50%
+        for col in df.select_dtypes(include=["float64"]).columns:
+            df[col] = df[col].astype(np.float32)
+        for col in df.select_dtypes(include=["int64"]).columns:
+            df[col] = df[col].astype(np.int32)
+        # Convert repetitive string columns to category to save hundreds of MBs
+        for col in ["origin", "weather_model", "basin_name", "station_id"]:
+            if col in df.columns and df[col].dtype == "object":
+                df[col] = df[col].astype("category")
+        gc.collect()
+
+        # Subsample if max_samples is specified for low-resource environments (e.g. Colab 12GB RAM)
+        if max_samples is not None and len(df) > max_samples:
+            logger.info("[Memory Optimization] Trimming dataset from %d to %d rows...", len(df), max_samples)
+            df = df.iloc[:max_samples].reset_index(drop=True)
+            gc.collect()
 
         assert_valid_training_years(df)
-        df = standardize_dataframe_columns(df)
-        logger.info("Loaded training dataset: %d rows x %d columns", len(df), len(df.columns))
+        df = standardize_dataframe_columns(df, inplace=True)
+        logger.info("Loaded training dataset: %d rows x %d columns (RAM: %.2f MB)",
+                    len(df), len(df.columns), df.memory_usage().sum() / (1024 * 1024))
         _LOADED_DATASET_CACHE[cache_key] = df
         return df
 
@@ -482,13 +579,24 @@ def load_training_dataset(
                 vt = pd.to_datetime(df[time_col])
                 mask_2025 = vt.dt.year >= 2025
                 if mask_2025.any():
-                    df = df[~mask_2025].copy()
+                    df = df[~mask_2025].reset_index(drop=True)
+            for col in df.select_dtypes(include=["float64"]).columns:
+                df[col] = df[col].astype(np.float32)
+            for col in df.select_dtypes(include=["int64"]).columns:
+                df[col] = df[col].astype(np.int32)
+            for col in ["origin", "weather_model", "basin_name", "station_id"]:
+                if col in df.columns and df[col].dtype == "object":
+                    df[col] = df[col].astype("category")
+            if max_samples is not None and len(df) > max_samples:
+                df = df.iloc[:max_samples].reset_index(drop=True)
             assert_valid_training_years(df)
-            df = standardize_dataframe_columns(df)
-            logger.info("Loaded training dataset: %d rows x %d columns", len(df), len(df.columns))
+            df = standardize_dataframe_columns(df, inplace=True)
+            logger.info("Loaded training dataset: %d rows x %d columns (RAM: %.2f MB)",
+                        len(df), len(df.columns), df.memory_usage().sum() / (1024 * 1024))
             return df
 
     # Fallback to dev smoke test dataset
     logger.info("No feature dataset specified or found. Using synthetic dataset for %s...", weather_model)
     return generate_smoke_test_dataset(n_samples=100, weather_model=weather_model or "ecmwf_ifs")
+
 
