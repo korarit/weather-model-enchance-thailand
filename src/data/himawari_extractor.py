@@ -151,57 +151,147 @@ def extract_convective_evolution_features(
     return merged[cols_order]
 
 
-def save_himawari_partition(df: pd.DataFrame, anchor_time: pd.Timestamp, out_base_dir: Path = DEFAULT_HIMAWARI_OUT):
-    """Saves satellite snapshot features partitioned by YYYY/MM/DD."""
+def get_himawari_partition_path(anchor_time: pd.Timestamp, out_base_dir: Path = DEFAULT_HIMAWARI_OUT) -> Path:
+    """Returns the parquet path for the given anchor_time."""
     date_path = anchor_time.strftime("%Y/%m/%d")
     file_tag = anchor_time.strftime("%Y%m%d_%H%M")
-    
-    # Save Band 13 partition
-    b13_dir = out_base_dir / "band13_bt" / date_path
-    b13_dir.mkdir(parents=True, exist_ok=True)
-    b13_file = b13_dir / f"h9_b13_{file_tag}.parquet"
+    return out_base_dir / "band13_bt" / date_path / f"h9_b13_{file_tag}.parquet"
+
+
+def save_himawari_partition(df: pd.DataFrame, anchor_time: pd.Timestamp, out_base_dir: Path = DEFAULT_HIMAWARI_OUT) -> Path:
+    """Saves satellite snapshot features partitioned by YYYY/MM/DD."""
+    b13_file = get_himawari_partition_path(anchor_time, out_base_dir)
+    b13_file.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(b13_file, index=False, compression="snappy")
-    logger.info("Saved Himawari-9 Band 13 features: %s (%d rows)", b13_file, len(df))
     return b13_file
+
+
+def load_or_extract_himawari_features(
+    anchor_time: pd.Timestamp,
+    himawari_dir: Optional[Path] = None,
+) -> pd.DataFrame:
+    """
+    Loads saved Himawari-9 partition for anchor_time if it exists in himawari_dir,
+    otherwise computes/extracts features on the fly.
+    """
+    if himawari_dir:
+        target_file = get_himawari_partition_path(anchor_time, out_base_dir=Path(himawari_dir))
+        if target_file.exists():
+            return pd.read_parquet(target_file)
+    return extract_convective_evolution_features(anchor_time)
 
 
 def run_himawari_acquisition(
     start_dt: pd.Timestamp,
-    sample_hours: int = 12,
+    end_dt: Optional[pd.Timestamp] = None,
+    sample_hours: Optional[int] = None,
+    days: Optional[int] = None,
+    step_hours: int = 1,
+    cycles: Optional[List[int]] = None,
+    overwrite: bool = False,
     out_dir: Path = DEFAULT_HIMAWARI_OUT
 ) -> List[Path]:
-    """Generates and archives Himawari-9 cloud features across hourly steps."""
+    """Generates and archives Himawari-9 cloud features across timestamps."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Processing Himawari-9 cloud evolution features starting %s for %d hours...", start_dt, sample_hours)
-    
+
+    # Determine target timestamps
+    if cycles is not None and len(cycles) > 0:
+        effective_end = end_dt if end_dt is not None else (start_dt + pd.Timedelta(days=days or 1) - pd.Timedelta(seconds=1))
+        date_list = pd.date_range(start_dt.floor("D"), effective_end.floor("D"), freq="D")
+        timestamps = []
+        for d in date_list:
+            for ch in cycles:
+                ts = d + pd.Timedelta(hours=ch)
+                if start_dt <= ts <= effective_end:
+                    timestamps.append(ts)
+    elif end_dt is not None:
+        timestamps = pd.date_range(start=start_dt, end=end_dt, freq=f"{step_hours}h").tolist()
+    elif days is not None:
+        effective_end = start_dt + pd.Timedelta(days=days)
+        timestamps = pd.date_range(start=start_dt, end=effective_end, freq=f"{step_hours}h", inclusive="left").tolist()
+    else:
+        hours = sample_hours if sample_hours is not None else 6
+        timestamps = [start_dt + pd.Timedelta(hours=i * step_hours) for i in range(hours)]
+
+    if not timestamps:
+        logger.warning("No timestamps generated for the given range.")
+        return []
+
+    total_tasks = len(timestamps)
+    logger.info("Processing Himawari-9 features: %d snapshot(s) from %s to %s (step: %dh)...",
+                total_tasks, timestamps[0], timestamps[-1], step_hours)
+
     saved_files = []
-    current_dt = start_dt
-    for i in range(1, sample_hours + 1):
-        pct = (i / sample_hours) * 100
-        logger.info("[Satellite Progress: %d/%d (%.1f%%)] Extracting Himawari-9 snapshot for %s...",
-                    i, sample_hours, pct, current_dt)
+    for i, current_dt in enumerate(timestamps, start=1):
+        pct = (i / total_tasks) * 100
+        target_p = get_himawari_partition_path(current_dt, out_base_dir=out_dir)
+
+        if target_p.exists() and not overwrite:
+            saved_files.append(target_p)
+            if i % 100 == 1 or i == total_tasks or total_tasks <= 24:
+                logger.info("[Satellite Progress: %d/%d (%.1f%%)] [Cached] Found %s for %s",
+                            i, total_tasks, pct, target_p.name, current_dt)
+            continue
+
+        if i % 10 == 1 or i == total_tasks or total_tasks <= 24:
+            logger.info("[Satellite Progress: %d/%d (%.1f%%)] Extracting Himawari-9 snapshot for %s...",
+                        i, total_tasks, pct, current_dt)
         df_features = extract_convective_evolution_features(current_dt)
         p = save_himawari_partition(df_features, current_dt, out_base_dir=out_dir)
         saved_files.append(p)
-        current_dt += pd.Timedelta(hours=1)
 
-    logger.info("Himawari-9 acquisition finished: %d/%d hourly partitions saved at %s", len(saved_files), sample_hours, out_dir)
+    logger.info("Himawari-9 acquisition finished: %d snapshot partitions ready at %s", len(saved_files), out_dir)
     return saved_files
 
 
 def main():
     parser = argparse.ArgumentParser(description="Himawari-9 Convective Cloud Feature Extractor")
     parser.add_argument("--forecast-dir", "--satellite-dir", dest="forecast_dir", type=str, default=None, help="Base directory for forecast/satellite data (e.g. E:/data/weather_nwp)")
-    parser.add_argument("--out-dir", type=str, default=None, help="Output parquet dir (default: {forecast-dir}/himawari9 or data/himawari9)")
-    parser.add_argument("--start", type=str, default="2021-01-01 00:00:00", help="Start timestamp")
-    parser.add_argument("--sample-hours", type=int, default=6, help="Hours to process in dev mode")
-    parser.add_argument("--full", action="store_true", help="Server production full mode")
+    parser.add_argument("--out-dir", "--output-dir", dest="out_dir", type=str, default=None, help="Output parquet dir (default: {forecast-dir}/himawari9 or data/himawari9)")
+    parser.add_argument("--start", type=str, default="2021-01-01 00:00:00", help="Start timestamp or date (default: 2021-01-01 00:00:00)")
+    parser.add_argument("--end", type=str, default=None, help="End timestamp or date (e.g. 2024-12-31 or 2025-12-31)")
+    parser.add_argument("--days", "--sample-days", dest="days", type=int, default=None, help="Number of days to process")
+    parser.add_argument("--sample-hours", "--hours", dest="sample_hours", type=int, default=None, help="Hours to process in dev mode (default: 6)")
+    parser.add_argument("--step-hours", type=int, default=None, help="Step hours between snapshots (default: 6 for multi-day, 1 for sample-hours)")
+    parser.add_argument("--cycles", type=str, default=None, help="Comma-separated cycle hours (e.g. '00,06,12,18' or '00,12')")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing cached partitions")
+    parser.add_argument("--full", action="store_true", help="Server production full mode (2021-01-01 to 2024-12-31)")
     args = parser.parse_args()
 
     paths = resolve_forecast_paths(forecast_dir=args.forecast_dir, himawari_dir=args.out_dir)
+    out_dir = paths["himawari_dir"]
     start_dt = pd.Timestamp(args.start)
-    hours = args.sample_hours if not args.full else 720
-    run_himawari_acquisition(start_dt=start_dt, sample_hours=hours, out_dir=paths["himawari_dir"])
+
+    end_dt = None
+    if args.end:
+        end_dt = pd.Timestamp(args.end)
+        # If end has no time specified (00:00:00), include the entire day up to 23:00
+        if end_dt == end_dt.floor("D"):
+            end_dt = end_dt + pd.Timedelta(hours=23)
+    elif args.full:
+        end_dt = pd.Timestamp("2024-12-31 23:00:00")
+
+    cycles_list = None
+    if args.cycles:
+        cycles_list = [int(c.strip()) for c in args.cycles.split(",") if c.strip().isdigit()]
+
+    if args.step_hours is not None:
+        step_h = args.step_hours
+    elif end_dt is not None or (args.days is not None and args.days > 1):
+        step_h = 6 if cycles_list is None else 1
+    else:
+        step_h = 1
+
+    run_himawari_acquisition(
+        start_dt=start_dt,
+        end_dt=end_dt,
+        sample_hours=args.sample_hours,
+        days=args.days,
+        step_hours=step_h,
+        cycles=cycles_list,
+        overwrite=args.overwrite,
+        out_dir=out_dir
+    )
 
 
 if __name__ == "__main__":

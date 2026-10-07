@@ -268,7 +268,7 @@ def build_feature_matrices(
     if not target_files:
         raise RuntimeError("No NWP forecast runs available to build features.")
 
-    from src.data.himawari_extractor import extract_convective_evolution_features
+    from src.data.himawari_extractor import load_or_extract_himawari_features
 
     logger.info("[Feature Step 4/4] Fusing Topography, Ground Observations and Satellite for %d cycle(s)...", len(target_files))
     saved_files = []
@@ -290,7 +290,7 @@ def build_feature_matrices(
             lookback_hours=3
         )
 
-        sat_df = extract_convective_evolution_features(run_time)
+        sat_df = load_or_extract_himawari_features(run_time, himawari_dir=himawari_dir)
         unified_matrix = assemble_unified_training_matrix(
             nwp_forecast_df=nwp_df,
             himawari_features_df=sat_df,

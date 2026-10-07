@@ -120,9 +120,11 @@ def run_full_pipeline(
 
         # Extract satellite
         from src.data.himawari_extractor import run_himawari_acquisition
+        sat_end = pd.Timestamp("2021-01-02 23:00:00") if smoke_test else pd.Timestamp("2021-01-05 23:00:00")
         run_himawari_acquisition(
-            start_dt=Path(pd.Timestamp("2021-01-01 00:00:00") if "pd" in globals() else __import__("pandas").Timestamp("2021-01-01 00:00:00")),
-            sample_hours=3 if smoke_test else 24,
+            start_dt=pd.Timestamp("2021-01-01 00:00:00"),
+            end_dt=sat_end,
+            step_hours=12 if smoke_test else 6,
             out_dir=forecast_paths["himawari_dir"]
         )
 
