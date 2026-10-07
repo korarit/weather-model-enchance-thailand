@@ -22,6 +22,10 @@ import datetime
 import numpy as np
 import pandas as pd
 
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*invalid value encountered in log.*")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*All-NaN slice.*")
+
 import boto3
 from botocore import UNSIGNED
 from botocore.config import Config
@@ -186,7 +190,9 @@ def extract_satellite_band_to_grid(
 
     area = ds.attrs["area"]
     lons, lats = area.get_lonlats()
-    raw_vals = ds.values
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        raw_vals = ds.values
 
     # Filter pixels covering Thailand region (with 0.5 deg margin)
     lat_min, lat_max = float(grid_lats.min() - 0.5), float(grid_lats.max() + 0.5)

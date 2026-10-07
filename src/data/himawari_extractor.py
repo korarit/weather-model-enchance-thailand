@@ -21,6 +21,10 @@ import argparse
 import logging
 from typing import List, Dict, Tuple, Optional
 import datetime
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*invalid value encountered in log.*")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*All-NaN slice.*")
+
 import numpy as np
 import pandas as pd
 
