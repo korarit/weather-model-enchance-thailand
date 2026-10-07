@@ -71,12 +71,14 @@ def assert_no_dwr_leakage(file_path_or_str: str):
 
 def assert_valid_training_years(df: pd.DataFrame, time_col: str = "valid_time"):
     """Guarantees that 2025 data is strictly frozen and not present in training."""
-    years = pd.to_datetime(df[time_col]).dt.year.unique()
-    if 2025 in years:
-        raise ValueError(
-            "[FROZEN TEST LEAKAGE] Data from 2025 detected in training split! "
-            "2025 must remain strictly frozen for final out-of-time evaluation."
-        )
+    col = time_col if time_col in df.columns else ("run_time" if "run_time" in df.columns else "timestamp")
+    if col in df.columns:
+        years = pd.to_datetime(df[col]).dt.year.unique()
+        if 2025 in years:
+            raise ValueError(
+                f"[FROZEN TEST LEAKAGE] Data from 2025 detected in column '{col}' of training split! "
+                "2025 must remain strictly frozen for final out-of-time evaluation."
+            )
 
 
 SUPPORTED_WEATHER_MODELS = [
@@ -378,6 +380,9 @@ def resolve_runner_execution_targets(
     return weather_models, ablations, hyperparams
 
 
+_LOADED_DATASET_CACHE: Dict[str, pd.DataFrame] = {}
+
+
 def load_training_dataset(
     data_path_or_str: Optional[Union[str, Path]] = None,
     weather_model: Optional[str] = "ecmwf_ifs",
@@ -401,6 +406,11 @@ def load_training_dataset(
 
         assert_no_dwr_leakage(str(p))
 
+        cache_key = str(p.resolve())
+        if cache_key in _LOADED_DATASET_CACHE:
+            logger.info("Using cached in-memory dataset for %s (%d rows)", p.name, len(_LOADED_DATASET_CACHE[cache_key]))
+            return _LOADED_DATASET_CACHE[cache_key]
+
         if p.is_dir():
             # Check for combined parquet first
             combined_file = p / "training_features_combined.parquet"
@@ -413,8 +423,16 @@ def load_training_dataset(
                     files = sorted(list(p.glob("*.parquet")))
                 if not files:
                     raise FileNotFoundError(f"No parquet feature files found in directory: {p}")
-                logger.info("Found %d parquet feature file(s) in %s. Merging...", len(files), p)
-                dfs = [pd.read_parquet(f) for f in files]
+
+                # Exclude any 2025 feature files if present (strictly reserved for Phase 5 test evaluation)
+                train_files = [f for f in files if not f.name.startswith("training_features_2025")]
+                if len(train_files) < len(files):
+                    logger.info("Excluded %d test-year (2025) feature files from training split.", len(files) - len(train_files))
+                if not train_files:
+                    train_files = files
+
+                logger.info("Found %d parquet feature file(s) in %s. Merging...", len(train_files), p)
+                dfs = [pd.read_parquet(f) for f in train_files]
                 df = pd.concat(dfs, ignore_index=True)
         elif p.is_file():
             logger.info("Loading training features from file: %s", p)
@@ -422,26 +440,49 @@ def load_training_dataset(
         else:
             raise FileNotFoundError(f"Feature dataset path not found: {p}")
 
+        # Strict Test Set Isolation: Filter out any rows with valid_time or run_time in 2025
+        # (e.g. from 2024-12-31 forecast cycles predicting +24h into Jan 1, 2025)
+        time_col = "valid_time" if "valid_time" in df.columns else ("run_time" if "run_time" in df.columns else "timestamp")
+        if time_col in df.columns:
+            vt = pd.to_datetime(df[time_col])
+            mask_2025 = vt.dt.year >= 2025
+            if mask_2025.any():
+                n_leaked = int(mask_2025.sum())
+                df = df[~mask_2025].copy()
+                logger.info(
+                    "[Test Set Isolation] Excluded %d rows where %s >= 2025 "
+                    "(keeping 2025 strictly frozen for Phase 5 out-of-time evaluation).",
+                    n_leaked, time_col
+                )
+
         assert_valid_training_years(df)
         df = standardize_dataframe_columns(df)
         logger.info("Loaded training dataset: %d rows x %d columns", len(df), len(df.columns))
+        _LOADED_DATASET_CACHE[cache_key] = df
         return df
 
     # If data_path_or_str is None, check DEFAULT_FEATURES_DIR
     default_dir = DEFAULT_FEATURES_DIR
     if default_dir.exists():
         combined_file = default_dir / "training_features_combined.parquet"
+        df = None
         if combined_file.exists():
             logger.info("Auto-detected combined training features at: %s", combined_file)
             df = pd.read_parquet(combined_file)
-            assert_valid_training_years(df)
-            df = standardize_dataframe_columns(df)
-            logger.info("Loaded training dataset: %d rows x %d columns", len(df), len(df.columns))
-            return df
-        files = sorted(list(default_dir.glob("training_features_*.parquet")))
-        if files:
-            logger.info("Auto-detected %d feature file(s) in %s. Merging...", len(files), default_dir)
-            df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+        else:
+            files = sorted(list(default_dir.glob("training_features_*.parquet")))
+            if files:
+                train_files = [f for f in files if not f.name.startswith("training_features_2025")]
+                logger.info("Auto-detected %d feature file(s) in %s. Merging...", len(train_files), default_dir)
+                df = pd.concat([pd.read_parquet(f) for f in train_files], ignore_index=True)
+
+        if df is not None:
+            time_col = "valid_time" if "valid_time" in df.columns else ("run_time" if "run_time" in df.columns else "timestamp")
+            if time_col in df.columns:
+                vt = pd.to_datetime(df[time_col])
+                mask_2025 = vt.dt.year >= 2025
+                if mask_2025.any():
+                    df = df[~mask_2025].copy()
             assert_valid_training_years(df)
             df = standardize_dataframe_columns(df)
             logger.info("Loaded training dataset: %d rows x %d columns", len(df), len(df.columns))
