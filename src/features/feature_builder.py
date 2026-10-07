@@ -232,6 +232,7 @@ def build_feature_matrices(
     himawari_dir: Path = DEFAULT_HIMAWARI_DIR,
     process_all: bool = False,
     combine: bool = True,
+    overwrite: bool = False,
 ) -> List[Path]:
     """
     Executes feature assembly across NWP forecast cycles.
@@ -272,13 +273,20 @@ def build_feature_matrices(
 
     logger.info("[Feature Step 4/4] Fusing Topography, Ground Observations and Satellite for %d cycle(s)...", len(target_files))
     saved_files = []
-    matrix_list = []
-
     total_targets = len(target_files)
     for idx, f in enumerate(target_files, start=1):
         pct = (idx / total_targets) * 100
         nwp_df = pd.read_parquet(f)
         run_time = nwp_df["run_time"].iloc[0]
+        out_file = output_dir / f"training_features_{run_time.strftime('%Y%m%d_%Hz')}.parquet"
+
+        # Checkpoint / Resume resilience: skip already processed cycles
+        if out_file.exists() and not overwrite:
+            logger.info("  -> [%d/%d (%.1f%%)] [Cached] Found %s (skipping re-generation)...",
+                        idx, total_targets, pct, out_file.name)
+            saved_files.append(out_file)
+            continue
+
         logger.info("  -> [%d/%d (%.1f%%)] Building feature matrix for cycle %s (%s)...",
                     idx, total_targets, pct, run_time, f.name)
 
@@ -298,19 +306,23 @@ def build_feature_matrices(
             grid_df=grid_df,
             indexer=indexer
         )
-        out_file = output_dir / f"training_features_{run_time.strftime('%Y%m%d_%Hz')}.parquet"
         unified_matrix.to_parquet(out_file, index=False, compression="snappy")
+        logger.info("  -> [%d/%d] Saved %s (%d rows)", idx, total_targets, out_file.name, len(unified_matrix))
         saved_files.append(out_file)
-        if combine:
-            matrix_list.append(unified_matrix)
 
-    if combine and len(matrix_list) > 1:
-        combined_matrix = pd.concat(matrix_list, ignore_index=True)
+    if combine and len(saved_files) > 1:
         combined_file = output_dir / "training_features_combined.parquet"
-        combined_matrix.to_parquet(combined_file, index=False, compression="snappy")
-        logger.info("Combined feature matrix created across %d cycles: %s (%d rows)",
-                    len(matrix_list), combined_file.name, len(combined_matrix))
-        saved_files.append(combined_file)
+        if combined_file.exists() and not overwrite and len(saved_files) == total_targets:
+            logger.info("[Cached] Combined feature matrix already exists: %s", combined_file.name)
+        else:
+            logger.info("Merging %d cycle partitions into combined matrix...", len(saved_files))
+            dfs = [pd.read_parquet(f) for f in saved_files if f != combined_file]
+            combined_matrix = pd.concat(dfs, ignore_index=True)
+            combined_matrix.to_parquet(combined_file, index=False, compression="snappy")
+            logger.info("Combined feature matrix created across %d cycles: %s (%d rows)",
+                        len(dfs), combined_file.name, len(combined_matrix))
+        if combined_file not in saved_files:
+            saved_files.append(combined_file)
 
     logger.info("Saved %d training feature matrix file(s) in: %s", len(saved_files), output_dir)
     return saved_files
@@ -324,6 +336,7 @@ def run_sample_builder(
     raw_nwp_dir: Path = DEFAULT_RAW_NWP_DIR,
     out_nwp_dir: Path = DEFAULT_OUT_NWP_DIR,
     himawari_dir: Path = DEFAULT_HIMAWARI_DIR,
+    overwrite: bool = False,
 ) -> Path:
     """Executes single sample cycle feature assembly (backward compatible)."""
     files = build_feature_matrices(
@@ -335,7 +348,8 @@ def run_sample_builder(
         out_nwp_dir=out_nwp_dir,
         himawari_dir=himawari_dir,
         process_all=False,
-        combine=False
+        combine=False,
+        overwrite=overwrite,
     )
     return files[0]
 
@@ -358,6 +372,7 @@ def main():
     parser.add_argument("--output-dir", "--out-dir", dest="output_dir", type=str, default=str(DEFAULT_FEATURES_DIR), help="Output features directory")
     parser.add_argument("--all", action="store_true", help="Process all available NWP forecast cycles in out-nwp-dir")
     parser.add_argument("--no-combine", dest="combine", action="store_false", default=True, help="Disable combining all cycles into training_features_combined.parquet")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing cached cycle feature parquets")
     args = parser.parse_args()
 
     hii_paths = resolve_hii_paths(hii_dir=args.hii_dir, meta_dir=args.hii_meta_dir, clean_dir=args.hii_clean_dir)
@@ -378,6 +393,7 @@ def main():
         himawari_dir=forecast_paths["himawari_dir"],
         process_all=args.all,
         combine=args.combine,
+        overwrite=args.overwrite,
     )
 
 
