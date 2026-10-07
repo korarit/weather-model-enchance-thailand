@@ -35,6 +35,7 @@ DEFAULT_HIMAWARI_DIR = Path(os.getenv("HIMAWARI_DIR", DEFAULT_FORECAST_DIR / "hi
 # 3. Common Geographic & Feature Matrix Defaults
 # --------------------------------------------------------------------------
 DEFAULT_GEO_DIR = Path(os.getenv("GEO_DATA_DIR", DEFAULT_DATA_DIR / "geo"))
+DEFAULT_DEM_DIR = Path(os.getenv("DEM_DATA_DIR", DEFAULT_GEO_DIR / "dem"))
 DEFAULT_FEATURES_DIR = Path(os.getenv("FEATURES_DIR", DEFAULT_DATA_DIR / "features"))
 
 

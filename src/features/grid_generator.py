@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import argparse
 import logging
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 import numpy as np
 import pandas as pd
 import pyproj
@@ -25,7 +25,8 @@ import pyproj
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-DEFAULT_GEO_DIR = PROJECT_ROOT / "data" / "geo"
+from src.config.paths import DEFAULT_GEO_DIR, DEFAULT_DEM_DIR
+from src.features.copernicus_dem import extract_copernicus_topography
 
 # Geographic Bounds of Thailand
 LAT_MIN, LAT_MAX = 5.5, 20.5
@@ -109,13 +110,19 @@ def estimate_synthetic_topography(lat: np.ndarray, lon: np.ndarray) -> Dict[str,
 def generate_master_grid(
     step_meters: float = 2000.0,
     sample_subsample: int = 1,
-    output_dir: Path = DEFAULT_GEO_DIR
+    output_dir: Path = DEFAULT_GEO_DIR,
+    dem_source: str = "copernicus",
+    dem_dir: Path = DEFAULT_DEM_DIR,
+    max_dem_tiles: Optional[int] = None,
+    allow_streaming: bool = False,
 ) -> pd.DataFrame:
     """
     Generates regular Thailand grid in UTM 47N and transforms to WGS84 Lat/Lon.
+    Computes topographic features from Copernicus DEM 30m or synthetic baseline.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Generating Thailand Master Grid [spacing=%.1f m, subsample=%d]...", step_meters, sample_subsample)
+    logger.info("Generating Thailand Master Grid [spacing=%.1f m, subsample=%d, dem_source=%s]...",
+                step_meters, sample_subsample, dem_source)
 
     to_utm, to_wgs = get_transformers()
 
@@ -162,8 +169,19 @@ def generate_master_grid(
     # Generate Unique Cell IDs
     cell_ids = [f"GRID_{i+1:06d}" for i in range(n_cells)]
 
-    # Compute Topography
-    topo_attrs = estimate_synthetic_topography(lat_selected, lon_selected)
+    # Compute Topography (Copernicus DEM 30m or Synthetic Baseline)
+    if dem_source == "copernicus":
+        logger.info("Extracting topography using Copernicus DEM 30m (dem_dir=%s)...", dem_dir)
+        topo_attrs = extract_copernicus_topography(
+            lat_selected,
+            lon_selected,
+            dem_dir=dem_dir,
+            allow_streaming=allow_streaming,
+            max_tiles=max_dem_tiles,
+        )
+    else:
+        logger.info("Estimating topography using Synthetic mathematical terrain model...")
+        topo_attrs = estimate_synthetic_topography(lat_selected, lon_selected)
 
     df_grid = pd.DataFrame({
         "grid_id": cell_ids,
@@ -196,12 +214,20 @@ def main():
     parser.add_argument("--step-meters", type=float, default=2000.0, help="Grid step in meters (default 2000m)")
     parser.add_argument("--sample-subsample", type=int, default=1, help="Subsample step factor for dev mode (e.g. 5 for rapid preview, 1 for full 2km)")
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_GEO_DIR), help="Output directory")
+    parser.add_argument("--dem-source", choices=["copernicus", "synthetic"], default="copernicus", help="Topography DEM source (copernicus or synthetic)")
+    parser.add_argument("--dem-dir", type=str, default=str(DEFAULT_DEM_DIR), help="Directory containing Copernicus DEM GeoTIFF files")
+    parser.add_argument("--max-dem-tiles", type=int, default=None, help="Max Copernicus tiles to process (useful for rapid testing)")
+    parser.add_argument("--allow-streaming", action="store_true", help="Allow direct HTTP streaming from AWS S3 if tile is not cached locally")
     args = parser.parse_args()
 
     generate_master_grid(
         step_meters=args.step_meters,
         sample_subsample=args.sample_subsample,
-        output_dir=Path(args.output_dir)
+        output_dir=Path(args.output_dir),
+        dem_source=args.dem_source,
+        dem_dir=Path(args.dem_dir),
+        max_dem_tiles=args.max_dem_tiles,
+        allow_streaming=args.allow_streaming,
     )
 
 
