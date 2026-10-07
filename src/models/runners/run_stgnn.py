@@ -26,6 +26,8 @@ from src.models.common import (
     assert_no_dwr_leakage,
     assert_valid_training_years,
     resolve_runner_execution_targets,
+    standardize_dataframe_columns,
+    resolve_lat_lon,
 )
 
 logger = logging.getLogger(__name__)
@@ -92,8 +94,9 @@ def train_and_eval_stgnn(
 
     X_mat = df[features].copy().fillna(0.0).to_numpy(dtype=np.float32)
     y_vec = df["target_bias"].to_numpy(dtype=np.float32)
-    lats = df["lat"].to_numpy(dtype=float)
-    lons = df["lon"].to_numpy(dtype=float)
+    lat_s, lon_s = resolve_lat_lon(df)
+    lats = lat_s.to_numpy(dtype=float)
+    lons = lon_s.to_numpy(dtype=float)
 
     adj = build_spatial_adjacency(lats, lons)
 
@@ -173,6 +176,7 @@ def main():
             assert_no_dwr_leakage(args.data_file)
             df = pd.read_parquet(args.data_file)
             assert_valid_training_years(df)
+            df = standardize_dataframe_columns(df)
         else:
             df = generate_smoke_test_dataset(n_samples=100, weather_model=wm)
 

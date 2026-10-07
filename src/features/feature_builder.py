@@ -146,6 +146,9 @@ def assemble_unified_training_matrix(
         "lon": "target_lon",
     }
     merged = merged.rename(columns=rename_map)
+    # Maintain lat/lon aliases alongside target_lat/target_lon for seamless modeling interoperability
+    merged["lat"] = merged["target_lat"]
+    merged["lon"] = merged["target_lon"]
 
     # Add Target: observed_rain and target_bias
     if observed_rain_dict:

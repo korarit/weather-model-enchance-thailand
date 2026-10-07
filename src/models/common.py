@@ -175,6 +175,73 @@ def generate_smoke_test_dataset(
     return pd.DataFrame(records)
 
 
+def resolve_lat_lon(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    """
+    Extracts latitude and longitude Series from DataFrame supporting
+    multiple column naming conventions: ('lat', 'lon'), ('target_lat', 'target_lon'), ('latitude', 'longitude').
+    """
+    if "lat" in df.columns:
+        lat = df["lat"]
+    elif "target_lat" in df.columns:
+        lat = df["target_lat"]
+    elif "latitude" in df.columns:
+        lat = df["latitude"]
+    else:
+        lat = pd.Series(0.0, index=df.index, dtype=float)
+
+    if "lon" in df.columns:
+        lon = df["lon"]
+    elif "target_lon" in df.columns:
+        lon = df["target_lon"]
+    elif "longitude" in df.columns:
+        lon = df["longitude"]
+    else:
+        lon = pd.Series(0.0, index=df.index, dtype=float)
+
+    return lat, lon
+
+
+def standardize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Standardizes coordinate and common metadata column names in training/validation DataFrames
+    to ensure compatibility across feature generation pipelines, runners, and prediction exports.
+    """
+    df = df.copy()
+    # Coordinates: ensure 'lat' and 'lon' as well as 'target_lat' and 'target_lon' exist
+    lat_s, lon_s = resolve_lat_lon(df)
+    if "lat" not in df.columns:
+        df["lat"] = lat_s
+    if "lon" not in df.columns:
+        df["lon"] = lon_s
+    if "target_lat" not in df.columns:
+        df["target_lat"] = lat_s
+    if "target_lon" not in df.columns:
+        df["target_lon"] = lon_s
+
+    # Lead time: ensure 'lead_time_hours' and 'lead_time'
+    if "lead_time_hours" not in df.columns and "lead_time" in df.columns:
+        df["lead_time_hours"] = df["lead_time"]
+    elif "lead_time" not in df.columns and "lead_time_hours" in df.columns:
+        df["lead_time"] = df["lead_time_hours"]
+
+    # Station ID / Grid ID
+    if "station_id" not in df.columns and "grid_id" in df.columns:
+        df["station_id"] = df["grid_id"]
+
+    # Basin ID
+    if "basin_id" not in df.columns:
+        if "basin_name" in df.columns:
+            df["basin_id"] = df["basin_name"]
+        else:
+            df["basin_id"] = "General"
+
+    # Raw NWP rain
+    if "nwp_rain_raw" not in df.columns and "tp" in df.columns:
+        df["nwp_rain_raw"] = df["tp"]
+
+    return df
+
+
 def export_predictions(
     df: pd.DataFrame,
     predicted_bias: np.ndarray,
@@ -192,20 +259,37 @@ def export_predictions(
     pred_dir = output_dir / "predictions" / model_name
     pred_dir.mkdir(parents=True, exist_ok=True)
 
-    nwp_raw = df["nwp_rain_raw"].to_numpy(dtype=float)
+    # Standardize columns to safely resolve lat, lon, lead_time, etc.
+    df = standardize_dataframe_columns(df)
+
+    nwp_raw = df["nwp_rain_raw"].to_numpy(dtype=float) if "nwp_rain_raw" in df.columns else np.zeros(len(df), dtype=float)
     bias = np.array(predicted_bias, dtype=float)
     corrected = np.maximum(0.0, nwp_raw + bias)
 
+    station_series = df["station_id"] if "station_id" in df.columns else (df["grid_id"] if "grid_id" in df.columns else pd.Series("STN_UNKNOWN", index=df.index))
+    basin_series = df["basin_id"] if "basin_id" in df.columns else pd.Series("General", index=df.index)
+
+    if "observed_rain" in df.columns:
+        obs_rain_series = df["observed_rain"].astype(np.float32)
+    elif "target_bias" in df.columns:
+        obs_rain_series = (nwp_raw + df["target_bias"].to_numpy(dtype=float)).astype(np.float32)
+    else:
+        obs_rain_series = nwp_raw.astype(np.float32)
+
+    valid_time_series = pd.to_datetime(df["valid_time"]).dt.strftime("%Y-%m-%dT%H:%M:%SZ") if "valid_time" in df.columns else pd.Series("2021-01-01T00:00:00Z", index=df.index)
+    run_time_series = pd.to_datetime(df["run_time"]).dt.strftime("%Y-%m-%dT%H:%M:%SZ") if "run_time" in df.columns else pd.Series("2021-01-01T00:00:00Z", index=df.index)
+    lead_time_series = df["lead_time_hours"].astype(int) if "lead_time_hours" in df.columns else (df["lead_time"].astype(int) if "lead_time" in df.columns else pd.Series(0, index=df.index, dtype=int))
+
     out_df = pd.DataFrame({
-        "valid_time": pd.to_datetime(df["valid_time"]).dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "run_time": pd.to_datetime(df["run_time"]).dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "lead_time": df["lead_time_hours"].astype(int),
+        "valid_time": valid_time_series,
+        "run_time": run_time_series,
+        "lead_time": lead_time_series,
         "weather_model": weather_model,
-        "station_id": df.get("station_id", df.get("grid_id", "STN_UNKNOWN")),
+        "station_id": station_series,
         "lat": df["lat"].astype(np.float32),
         "lon": df["lon"].astype(np.float32),
-        "basin_id": df.get("basin_id", "General"),
-        "observed_rain": df["observed_rain"].astype(np.float32),
+        "basin_id": basin_series,
+        "observed_rain": obs_rain_series,
         "nwp_raw_rain": nwp_raw.astype(np.float32),
         "predicted_bias": bias.astype(np.float32),
         "corrected_rain": corrected.astype(np.float32),

@@ -26,6 +26,7 @@ from src.models.common import (
     assert_no_dwr_leakage,
     assert_valid_training_years,
     resolve_runner_execution_targets,
+    standardize_dataframe_columns,
 )
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,7 @@ def main():
             assert_no_dwr_leakage(args.data_file)
             df = pd.read_parquet(args.data_file)
             assert_valid_training_years(df)
+            df = standardize_dataframe_columns(df)
         else:
             df = generate_smoke_test_dataset(n_samples=100, weather_model=wm)
 
