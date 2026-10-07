@@ -18,7 +18,7 @@
 1. **แบบจำลองพยากรณ์อากาศโลก (NWP Forecasts)**: ข้อมูล ECMWF IFS จากฐานข้อมูล TIGGE
 2. **ข้อมูลโทรมาตรสถานีวัดน้ำฝนภาคพื้นดิน (Ground Rain Gauges)**: จากสถาบันสารสนเทศทรัพยากรน้ำ (องค์การมหาชน) - HII
 3. **ภาพถ่ายดาวเทียมอุตุนิยมวิทยาแบบวงโคจรค้างฟ้า (Geostationary Satellite)**: Himawari-9 Band 08 (Water Vapor) และ Band 13 (Clean IR)
-4. **แบบจำลองระดับความสูงและภูมิประเทศเชิงพื้นที่ (Topography & Geomorphology)**: SRTM DEM, Slope, Aspect, Distance to Coast, และ Coriolis Parameter
+4. **แบบจำลองระดับความสูงและภูมิประเทศเชิงพื้นที่ (Topography & Geomorphology)**: **Copernicus DEM 30m (GLO-30)** จาก AWS Open Data (รองรับทั้งข้อมูลจริงและ Synthetic Baseline ผ่าน `--dem-source {copernicus, synthetic}`), ความลาดชัน (Slope), ทิศทางลาดชัน (Aspect), ระยะห่างจากแนวชายฝั่ง (Distance to Coast), และพารามิเตอร์คอริออลิส (Coriolis Parameter)
 
 ---
 
@@ -73,11 +73,32 @@
 5. **Spatio-Temporal Graph Neural Network (ST-GNN)**: แบบจำลองโครงข่ายกราฟเชิงพื้นที่-เวลา ผสาน GATv2 และ GRU เพื่อส่งผ่านข้อมูลสภาพอากาศระหว่างลุ่มน้ำ
 6. **2D Residual U-Net**: โครงข่าย Convolutional Neural Network ระดับสูง สำหรับการ Downscale และปรับแก้ Spatial Rain Fields ทั่วทั้ง 69,121 กริด
 
-### 3. ระดับการทดลองตัดทอนตัวแปร (3 Ablation Variants: 18 Runs + Baseline B0)
-* **Baseline $B_0$**: ค่าพยากรณ์ฝนดิบจาก ECMWF IFS (Raw NWP)
-* **$M_1$ (Ground Only)**: Raw NWP + ข้อมูลภูมิประเทศ + สถิติสถานีข้างเคียงภาคพื้นดิน
-* **$M_2$ (Satellite Only)**: Raw NWP + ข้อมูลภูมิประเทศ + อุณหภูมิยอดเมฆและอัตราการก่อตัวจากดาวเทียม Himawari-9
-* **$M_3$ (Full Multi-Modal)**: Raw NWP + ภูมิประเทศ + สถานีภาคพื้นดิน + ดาวเทียม Himawari-9
+### 3. ระดับการทดลองตัดทอนตัวแปรและตารางฟีเจอร์ในการเทรน (Feature Engineering & Ablation Variants)
+
+โมเดลทั้งหมดจะถูกฝึกสอนผ่าน **3 Ablation Variants ($M_1, M_2, M_3$)** เพื่อประเมินคุณค่าเชิงเพิ่ม (Marginal Value) ของแต่ละแหล่งข้อมูล เทียบกับ **Baseline $B_0$ (Raw NWP Forecast)** โดยหลอมรวมตัวแปรทั้งหมด 4 กลุ่ม:
+
+#### 📋 รายการฟีเจอร์แยกตามกลุ่มข้อมูล (Feature Groups Breakdown)
+
+| กลุ่มข้อมูล (Feature Group) | จำนวน | รายการฟีเจอร์ (Feature Names) | บทบาททางอุตุนิยมวิทยาและฟิสิกส์ |
+| :--- | :---: | :--- | :--- |
+| **1. NWP Forecasts** | 7 | `nwp_rain_raw`, `nwp_pressure`, `nwp_temp_2m`, `nwp_u10`, `nwp_v10`, `nwp_cape`, `lead_time_hours` | ค่าคาดการณ์บรรยากาศดิบจากแบบจำลองสภาพอากาศโลก (ECMWF IFS / NCEP GFS / DWD ICON) |
+| **2. Topography & Geo** | 7 | `elevation_m`, `elevation_std`, `slope_deg`, `aspect_sin`, `aspect_cos`, `dist_coast_km`, `coriolis_param` | สภาพภูมิประเทศจริงจาก **Copernicus DEM 30m** (Orographic Lifting, ความขรุขระของเทือกเขา, การปะทะลมมรสุม, ระยะห่างทะเล, แรงคอริออลิส) |
+| **3. Ground Telemetry** | 17 | `rain_mean_2_5km`, `rain_max_2_5km`, `pressure_mean_2_5km`, `pressure_std_2_5km`, `humidity_mean_2_5km`, `humidity_std_2_5km`, `nearest_stn_dist_2_5km`, `nearest_stn_bearing_sin`, `nearest_stn_bearing_cos`, `rain_mean_5_10km`, `rain_max_5_10km`, `pressure_mean_5_10km`, `humidity_mean_5_10km`, `pressure_mean_20_50km`, `humidity_mean_20_50km`, `pressure_gradient_mag`, `humidity_gradient_mag` | สถิติสถานีวัดน้ำฝนภาคพื้นดิน HII แบบวงแหวนหลายรัศมี (ตัดสถานี < 2 km ป้องกัน Data Leakage) และความชันบรรยากาศ ($\nabla P, \nabla RH$) |
+| **4. Himawari-9 Satellite** | 8 | `bt_mean_t0`, `bt_min_t0`, `bt_std`, `bt_mean_lag10m`, `bt_mean_lag20m`, `bt_mean_lag30m`, `delta_bt_30`, `wv_mean` | อุณหภูมิยอดเมฆอินฟราเรด (Band 13 Clean IR), ไอน้ำ (Band 08 WV), และอัตราการเย็นตัวฉับพลันใน 30 นาที ($\Delta T_{B13}$) ชี้วัดเมฆฝนฟ้าคะนองรุนแรง |
+
+#### 📊 ตารางการจัดสรรฟีเจอร์ในการเทรนแต่ละ Variant (Ablation Matrix)
+
+| กลุ่มฟีเจอร์ (Feature Group) | Baseline ($B_0$) | $M_1$ (Ground Only) | $M_2$ (Satellite Only) | $M_3$ (Joint Ground + Satellite) |
+| :--- | :---: | :---: | :---: | :---: |
+| **NWP Features** (7 ตัว) | ✅ *(ฝนดิบเท่านั้น)* | ✅ | ✅ | ✅ |
+| **Topography Features** (7 ตัว, Copernicus DEM 30m) | ❌ | ✅ | ✅ | ✅ |
+| **Ground Telemetry** (17 ตัว, สถานี HII) | ❌ | ✅ | ❌ | ✅ |
+| **Himawari-9 Satellite** (8 ตัว, ดาวเทียม) | ❌ | ❌ | ✅ | ✅ |
+| **จำนวนฟีเจอร์ที่ใช้เทรนรวม (Total Features)** | **1 ฟีเจอร์** | **31 ฟีเจอร์** | **22 ฟีเจอร์** | **39 ฟีเจอร์** |
+
+* **$M_1$ (Ground Only - 31 Features)**: NWP + Topography + Ground Telemetry (เหมาะสำหรับพื้นที่ที่มีเครือข่ายสถานีภาคพื้นดินหนาแน่น)
+* **$M_2$ (Satellite Only - 22 Features)**: NWP + Topography + Himawari-9 Satellite (เหมาะสำหรับพื้นที่ห่างไกลหรือลุ่มน้ำที่ไม่มีสถานีตรวจวัด)
+* **$M_3$ (Joint Ground + Satellite - 39 Features)**: รวมทุกแหล่งข้อมูลเข้าด้วยกัน (Full Multi-Modal Architecture ให้ความแม่นยำสูงสุด)
 
 ---
 
@@ -114,11 +135,13 @@ weather-forcast-enhance/
 │   │   ├── hii_parser.py
 │   │   ├── himawari_extractor.py
 │   │   └── tigge_extractor.py
-│   ├── features/                       # Phase 3: Spatial Grid & 49 Feature Builder
-│   │   ├── grid_generator.py           # 69,121 National Grid Cells (EPSG:4326 & EPSG:32647)
+│   ├── features/                       # Phase 3: Spatial Grid & Multi-Modal Feature Builder
+│   │   ├── copernicus_dem.py           # Copernicus DEM 30m downloader & terrain gradient extractor
+│   │   ├── grid_generator.py           # 69,121 National Grid Cells (--dem-source copernicus/synthetic)
 │   │   ├── spatial_features.py         # Multi-radius atmospheric gradients (<2km exclusion)
-│   │   ├── feature_builder.py          # Unified 49-feature dataframe pipeline
-│   │   └── test_spatial_features.py    # Unit tests ยืนยันความปลอดภัยเชิงพื้นที่
+│   │   ├── feature_builder.py          # Unified multi-modal feature matrix assembler (M1, M2, M3)
+│   │   ├── test_copernicus_dem.py      # Unit tests สำหรับ Copernicus DEM 30m
+│   │   └── test_spatial_features.py    # Unit tests ยืนยันความปลอดภัยเชิงพื้นที่ (<2km exclusion)
 │   ├── models/                         # Phase 4: Decoupled Model Runners
 │   │   ├── common.py                   # Protocol, Feature groups, Smoke dataset generator
 │   │   ├── generate_configs.py         # ตัวสร้างไฟล์ YAML Configs 18 ไฟล์
@@ -212,8 +235,8 @@ python src/data/himawari_extractor.py --forecast-dir "E:/data/nwp" --sample-hour
 ##### ขั้นตอนที่ 5: สร้าง Master Grid 2 km และรวมฟีเจอร์เข้า Matrix (Multi-Modal Feature Assembly)
 รวมข้อมูล HII Ground Obs เข้ากับ NWP Forecast และ Satellite Features โดยชี้พาธแยกกัน:
 ```bash
-# 5.1 สร้าง 2 km National Grid
-python src/features/grid_generator.py
+# 5.1 สร้าง 2 km National Grid ด้วย Copernicus DEM 30m (หรือระบุ --dem-source synthetic)
+python src/features/grid_generator.py --dem-source copernicus
 
 # 5.2 รัน Feature Builder ชี้ทั้ง HII และ Forecast จากพาธที่ตั้งไว้
 python src/features/feature_builder.py \
@@ -282,17 +305,46 @@ python src/data/anti_leakage_validator.py
 
 ---
 
-### 4. Phase 3: การสร้าง 2 km National Grid และฟีเจอร์เชิงพื้นที่ (Spatial Features Engine)
+### 4. Phase 3: การสร้าง 2 km National Grid และภูมิประเทศ Copernicus DEM 30m (Spatial Features Engine)
 
-สร้างตารางกริด 2 km ทั่วประเทศ 69,121 เซลล์ และทดสอบการสร้างฟีเจอร์ 49 ตัวแปร:
+สร้างตารางกริด 2 km ทั่วประเทศ 69,121 เซลล์ พร้อมสกัดค่าภูมิประเทศความละเอียดสูงจาก **Copernicus DEM 30m (GLO-30)**:
+
+#### 4.1 การสร้าง Master Grid และตัวเลือกแหล่งข้อมูลภูมิประเทศ (`--dem-source`)
+ระบบรองรับการสร้างกริด 2 โหมดผ่านพารามิเตอร์ `--dem-source`:
+* **`--dem-source copernicus` (ค่าเริ่มต้น)**: สกัดค่าความสูงจริงจากไฟล์ Copernicus DEM GeoTIFF 30m ใน `data/geo/dem/` เพื่อคำนวณ `elevation_m`, `elevation_std` (Roughness), `slope_deg`, และ `aspect` จากระนาบความชันจริง
+* **`--dem-source synthetic`**: ใช้แบบจำลองคณิตศาสตร์ภูมิประเทศจำลองของไทย (รวดเร็ว เหมาะสำหรับการพัฒนาหรือทดสอบที่ยังไม่ได้ดาวน์โหลดไฟล์ DEM)
+
 ```bash
-# สร้าง 2 km Grid และคำนวณพิกัด UTM
-python src/features/grid_generator.py
+# 1. สร้าง 2 km Master Grid ด้วย Copernicus DEM 30m (หากยังไม่มีไฟล์ไทล์จะใช้ค่า Baseline ชดเชยให้อัตโนมัติ)
+python src/features/grid_generator.py --dem-source copernicus
 
-# รัน Unit Tests ตรวจสอบกฎการตัดสถานีในรัศมี < 2 km
-python src/features/test_spatial_features.py
+# 2. หรือสร้างด้วย Synthetic Baseline ล้วนโดยไม่ต้องใช้ไฟล์ DEM
+python src/features/grid_generator.py --dem-source synthetic
 
-# รัน Feature Builder เพื่อสร้างตัวอย่างฟีเจอร์
+# 3. โหมด Dev Preview (สุ่มตัวอย่าง 10x และทดสอบเฉพาะ 1 ไทล์สำหรับรันด่วนในเครื่อง)
+python src/features/grid_generator.py --sample-subsample 10 --max-dem-tiles 1
+```
+
+#### 4.2 การดาวน์โหลด Copernicus DEM 30m (สำหรับ Google Colab หรือเครื่อง Local)
+ไฟล์ Copernicus DEM เป็นข้อมูลเปิดบน AWS Open Data S3 (`https://copernicus-dem-30m.s3.amazonaws.com`):
+
+```bash
+# ทดสอบดาวน์โหลดเฉพาะ 1 ไทล์ตัวอย่าง (เชียงใหม่ N18 E098 ~44.7 MB) สำหรับการทดสอบในเครื่อง Local
+python -m src.features.copernicus_dem --test-tile
+
+# ดาวน์โหลดครบทุกไทล์ครอบคลุมประเทศไทย (109 ไทล์ ~3.5 GB) ด้วย Multi-threads (แนะนำรันบน Google Colab)
+python -m src.features.copernicus_dem --download-all --max-workers 8
+```
+
+#### 4.3 การรัน Unit Tests และ Feature Builder
+```bash
+# รัน Unit Tests สำหรับ Copernicus DEM และการคำนวณ Slope/Aspect
+python -m pytest src/features/test_copernicus_dem.py
+
+# รัน Unit Tests ตรวจสอบกฎการตัดสถานีในรัศมี < 2 km ป้องกัน Data Leakage
+python -m pytest src/features/test_spatial_features.py
+
+# รวมฟีเจอร์ทุกมิติเข้า Feature Matrix (M1, M2, M3)
 python src/features/feature_builder.py
 ```
 
