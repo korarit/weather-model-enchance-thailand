@@ -26,6 +26,8 @@ import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*invalid value encountered in log.*")
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*All-NaN slice.*")
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import boto3
 from botocore import UNSIGNED
 from botocore.config import Config
@@ -116,55 +118,67 @@ def build_s3_prefix_and_keys(
     return bucket, keys
 
 
+def _download_and_extract_single_key(bucket: str, k: str, cache_dir: Path) -> Optional[Path]:
+    fname = Path(k).name
+    dat_fname = fname[:-4] if fname.endswith(".bz2") else fname
+    dat_path = cache_dir / dat_fname
+    bz2_path = cache_dir / fname
+
+    if dat_path.exists() and dat_path.stat().st_size > 0:
+        return dat_path
+
+    s3_client = boto3.client("s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED))
+    try:
+        logger.debug("Downloading s3://%s/%s -> %s", bucket, k, bz2_path.name)
+        s3_client.download_file(bucket, k, str(bz2_path))
+    except Exception as e:
+        logger.warning("Could not download s3://%s/%s: %s", bucket, k, e)
+        if bz2_path.exists():
+            bz2_path.unlink()
+        return None
+
+    try:
+        with bz2.open(bz2_path, "rb") as fin, open(dat_path, "wb") as fout:
+            fout.write(fin.read())
+        bz2_path.unlink()  # remove compressed file to save space
+        return dat_path
+    except Exception as e:
+        logger.warning("Failed decompressing %s: %s", bz2_path.name, e)
+        if bz2_path.exists():
+            bz2_path.unlink()
+        if dat_path.exists():
+            dat_path.unlink()
+        return None
+
+
 def download_and_extract_hsd_segments(
     bucket: str,
     keys: List[str],
     cache_dir: Path = DEFAULT_CACHE_DIR,
-    s3_client=None
+    max_workers: int = 4
 ) -> List[Path]:
     """
-    Downloads and decompresses .DAT.bz2 segments into local cache directory.
-    Returns the paths to the decompressed .DAT files.
+    Downloads and decompresses .DAT.bz2 segments into local cache directory in parallel.
+    Returns the paths to the decompressed .DAT files in the requested order.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    if s3_client is None:
-        s3_client = boto3.client("s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED))
+    if not keys:
+        return []
 
-    extracted_dats: List[Path] = []
-    for k in keys:
-        fname = Path(k).name
-        dat_fname = fname[:-4] if fname.endswith(".bz2") else fname
-        dat_path = cache_dir / dat_fname
-        bz2_path = cache_dir / fname
+    workers = min(len(keys), max_workers)
+    results_map = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futs = {executor.submit(_download_and_extract_single_key, bucket, k, cache_dir): k for k in keys}
+        for fut in as_completed(futs):
+            key = futs[fut]
+            try:
+                res = fut.result()
+                if res is not None:
+                    results_map[key] = res
+            except Exception as e:
+                logger.warning("Error downloading segment %s: %s", key, e)
 
-        if dat_path.exists() and dat_path.stat().st_size > 0:
-            extracted_dats.append(dat_path)
-            continue
-
-        # Download .bz2
-        try:
-            logger.debug("Downloading s3://%s/%s -> %s", bucket, k, bz2_path.name)
-            s3_client.download_file(bucket, k, str(bz2_path))
-        except Exception as e:
-            logger.warning("Could not download s3://%s/%s: %s", bucket, k, e)
-            if bz2_path.exists():
-                bz2_path.unlink()
-            continue
-
-        # Decompress
-        try:
-            with bz2.open(bz2_path, "rb") as fin, open(dat_path, "wb") as fout:
-                fout.write(fin.read())
-            bz2_path.unlink()  # remove compressed file to save space
-            extracted_dats.append(dat_path)
-        except Exception as e:
-            logger.warning("Failed decompressing %s: %s", bz2_path.name, e)
-            if bz2_path.exists():
-                bz2_path.unlink()
-            if dat_path.exists():
-                dat_path.unlink()
-
-    return extracted_dats
+    return [results_map[k] for k in keys if k in results_map]
 
 
 def extract_satellite_band_to_grid(
@@ -264,7 +278,8 @@ def fetch_himawari_observation_aws(
     target_dt: pd.Timestamp,
     band: str = "band13",
     cache_dir: Path = DEFAULT_CACHE_DIR,
-    cleanup_dat: bool = True
+    cleanup_dat: bool = True,
+    max_workers: int = 4
 ) -> pd.DataFrame:
     """
     High-level API: Fetches, extracts, and produces real Himawari observation DataFrame.
@@ -272,7 +287,7 @@ def fetch_himawari_observation_aws(
     bucket, keys = build_s3_prefix_and_keys(target_dt, band=band)
     logger.info("Fetching real Himawari %s from AWS S3 (%s)...", band, bucket)
 
-    dat_files = download_and_extract_hsd_segments(bucket, keys, cache_dir=cache_dir)
+    dat_files = download_and_extract_hsd_segments(bucket, keys, cache_dir=cache_dir, max_workers=max_workers)
     try:
         df_grid = extract_satellite_band_to_grid(dat_files, target_dt, band=band)
     finally:
@@ -285,6 +300,39 @@ def fetch_himawari_observation_aws(
                     pass
 
     return df_grid
+
+
+def fetch_himawari_convective_bundle_aws(
+    anchor_time: pd.Timestamp,
+    lookback_minutes: int = 30,
+    max_workers: int = 5,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+    cleanup_dat: bool = True
+) -> Tuple[List[pd.DataFrame], pd.DataFrame]:
+    """
+    Concurrently fetches multi-temporal Band 13 observations (t-30m, t-20m, t-10m, t0)
+    and Band 8 observation (t0) using a thread pool.
+    Drastically accelerates acquisition speed by running network I/O in parallel.
+    """
+    timestamps = [
+        anchor_time - pd.Timedelta(minutes=30),
+        anchor_time - pd.Timedelta(minutes=20),
+        anchor_time - pd.Timedelta(minutes=10),
+        anchor_time,
+    ]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        # Submit all 4 Band 13 requests and 1 Band 8 request simultaneously
+        futs_b13 = [
+            pool.submit(fetch_himawari_observation_aws, ts, "band13", cache_dir, cleanup_dat, 3)
+            for ts in timestamps
+        ]
+        fut_wv = pool.submit(fetch_himawari_observation_aws, anchor_time, "band08", cache_dir, cleanup_dat, 3)
+
+        dfs_b13 = [f.result() for f in futs_b13]
+        df_wv = fut_wv.result()
+
+    return dfs_b13, df_wv
 
 
 def check_coverage_across_years(

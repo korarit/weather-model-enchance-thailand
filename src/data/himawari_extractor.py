@@ -34,6 +34,7 @@ from src.config.paths import (
 )
 from src.data.himawari_aws_downloader import (
     fetch_himawari_observation_aws,
+    fetch_himawari_convective_bundle_aws,
     check_coverage_across_years,
 )
 
@@ -117,7 +118,8 @@ def generate_himawari_observation_timestamp(
 def extract_convective_evolution_features(
     anchor_time: pd.Timestamp,
     lookback_minutes: int = 30,
-    source: str = "aws_s3"
+    source: str = "aws_s3",
+    max_workers: int = 5
 ) -> pd.DataFrame:
     """
     Extracts multi-temporal Himawari features up to anchor_time (e.g. t, t-10m, t-20m, t-30m)
@@ -125,6 +127,7 @@ def extract_convective_evolution_features(
     Guarantees Anti-Leakage: Never accesses any timestamp > anchor_time!
     
     source: 'aws_s3' (real satellite observations from NOAA Open Data) or 'synthetic'.
+    max_workers: number of concurrent threads used for downloading segments and timestamps.
     """
     timestamps = [
         anchor_time - pd.Timedelta(minutes=30),
@@ -138,13 +141,14 @@ def extract_convective_evolution_features(
 
     if source == "aws_s3":
         try:
-            logger.info("Extracting real Himawari observations from AWS S3 for %s...", anchor_time)
-            for ts in timestamps:
-                df_ts = fetch_himawari_observation_aws(ts, band="band13")
-                dfs_b13.append(df_ts)
-            df_wv = fetch_himawari_observation_aws(anchor_time, band="band08")
+            logger.info("Extracting real Himawari observations (parallel) from AWS S3 for %s...", anchor_time)
+            dfs_b13, df_wv = fetch_himawari_convective_bundle_aws(
+                anchor_time,
+                lookback_minutes=lookback_minutes,
+                max_workers=max_workers
+            )
         except Exception as e:
-            logger.warning("AWS S3 fetch failed for %s (%s). Falling back to synthetic simulation.", anchor_time, e)
+            logger.warning("AWS S3 parallel fetch failed for %s (%s). Falling back to synthetic simulation.", anchor_time, e)
             dfs_b13 = []
             df_wv = None
 
@@ -217,6 +221,7 @@ def run_himawari_acquisition(
     step_hours: int = 1,
     cycles: Optional[List[int]] = None,
     source: str = "aws_s3",
+    max_workers: int = 5,
     overwrite: bool = False,
     out_dir: Path = DEFAULT_HIMAWARI_OUT
 ) -> List[Path]:
@@ -263,9 +268,9 @@ def run_himawari_acquisition(
             continue
 
         if i % 10 == 1 or i == total_tasks or total_tasks <= 24:
-            logger.info("[Satellite Progress: %d/%d (%.1f%%)] Extracting Himawari snapshot for %s (%s)...",
-                        i, total_tasks, pct, current_dt, source)
-        df_features = extract_convective_evolution_features(current_dt, source=source)
+            logger.info("[Satellite Progress: %d/%d (%.1f%%)] Extracting Himawari snapshot for %s (%s, workers=%d)...",
+                        i, total_tasks, pct, current_dt, source, max_workers)
+        df_features = extract_convective_evolution_features(current_dt, source=source, max_workers=max_workers)
         p = save_himawari_partition(df_features, current_dt, out_base_dir=out_dir)
         saved_files.append(p)
 
@@ -287,6 +292,7 @@ def main():
     parser.add_argument("--cycles", type=str, default=None, help="Comma-separated cycle hours (e.g. '00,06,12,18' or '00,12')")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing cached partitions")
     parser.add_argument("--full", action="store_true", help="Server production full mode (2021-01-01 to 2024-12-31)")
+    parser.add_argument("--max-workers", "--workers", dest="max_workers", type=int, default=5, help="Number of concurrent worker threads for downloading (default: 5)")
     args = parser.parse_args()
 
     if args.check_coverage:
@@ -332,6 +338,7 @@ def main():
         step_hours=step_h,
         cycles=cycles_list,
         source=args.source,
+        max_workers=args.max_workers,
         overwrite=args.overwrite,
         out_dir=out_dir
     )
