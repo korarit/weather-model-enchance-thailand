@@ -16,9 +16,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import logging
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union
 import numpy as np
 import pandas as pd
+
+from src.config.paths import DEFAULT_FEATURES_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -374,4 +376,78 @@ def resolve_runner_execution_targets(
 
     hyperparams = config_data.get("hyperparameters", {})
     return weather_models, ablations, hyperparams
+
+
+def load_training_dataset(
+    data_path_or_str: Optional[Union[str, Path]] = None,
+    weather_model: Optional[str] = "ecmwf_ifs",
+) -> pd.DataFrame:
+    """
+    Loads training dataset from a parquet file, directory, or falls back to smoke test data.
+    - Single file: reads parquet directly.
+    - Directory:
+        1. Prefers 'training_features_combined.parquet' if present.
+        2. Otherwise finds all 'training_features_*.parquet' and concatenates.
+    - None:
+        1. Checks DEFAULT_FEATURES_DIR for combined or cycle parquets.
+        2. If not found, generates synthetic smoke test dataset.
+    Enforces DWR blind test anti-leakage, 2025 frozen test year isolation,
+    and schema column standardization.
+    """
+    if data_path_or_str:
+        p = Path(data_path_or_str)
+        if not p.is_absolute() and not p.exists() and (PROJECT_ROOT / p).exists():
+            p = PROJECT_ROOT / p
+
+        assert_no_dwr_leakage(str(p))
+
+        if p.is_dir():
+            # Check for combined parquet first
+            combined_file = p / "training_features_combined.parquet"
+            if combined_file.exists():
+                logger.info("Found combined training features in directory: %s", combined_file)
+                df = pd.read_parquet(combined_file)
+            else:
+                files = sorted(list(p.glob("training_features_*.parquet")))
+                if not files:
+                    files = sorted(list(p.glob("*.parquet")))
+                if not files:
+                    raise FileNotFoundError(f"No parquet feature files found in directory: {p}")
+                logger.info("Found %d parquet feature file(s) in %s. Merging...", len(files), p)
+                dfs = [pd.read_parquet(f) for f in files]
+                df = pd.concat(dfs, ignore_index=True)
+        elif p.is_file():
+            logger.info("Loading training features from file: %s", p)
+            df = pd.read_parquet(p)
+        else:
+            raise FileNotFoundError(f"Feature dataset path not found: {p}")
+
+        assert_valid_training_years(df)
+        df = standardize_dataframe_columns(df)
+        logger.info("Loaded training dataset: %d rows x %d columns", len(df), len(df.columns))
+        return df
+
+    # If data_path_or_str is None, check DEFAULT_FEATURES_DIR
+    default_dir = DEFAULT_FEATURES_DIR
+    if default_dir.exists():
+        combined_file = default_dir / "training_features_combined.parquet"
+        if combined_file.exists():
+            logger.info("Auto-detected combined training features at: %s", combined_file)
+            df = pd.read_parquet(combined_file)
+            assert_valid_training_years(df)
+            df = standardize_dataframe_columns(df)
+            logger.info("Loaded training dataset: %d rows x %d columns", len(df), len(df.columns))
+            return df
+        files = sorted(list(default_dir.glob("training_features_*.parquet")))
+        if files:
+            logger.info("Auto-detected %d feature file(s) in %s. Merging...", len(files), default_dir)
+            df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+            assert_valid_training_years(df)
+            df = standardize_dataframe_columns(df)
+            logger.info("Loaded training dataset: %d rows x %d columns", len(df), len(df.columns))
+            return df
+
+    # Fallback to dev smoke test dataset
+    logger.info("No feature dataset specified or found. Using synthetic dataset for %s...", weather_model)
+    return generate_smoke_test_dataset(n_samples=100, weather_model=weather_model or "ecmwf_ifs")
 

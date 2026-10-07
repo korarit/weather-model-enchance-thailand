@@ -27,6 +27,7 @@ from src.models.common import (
     assert_valid_training_years,
     resolve_runner_execution_targets,
     standardize_dataframe_columns,
+    load_training_dataset,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,7 +124,7 @@ def main():
     parser.add_argument("--smoke-test", action="store_true", help="Run rapid smoke test on PC")
     parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/hurdle/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")
-    parser.add_argument("--data-file", type=str, help="Path to training features parquet")
+    parser.add_argument("--data-file", "--data-dir", "--data-path", dest="data_file", type=str, default=None, help="Path to training features parquet file or directory")
     args = parser.parse_args()
 
     dir_p = Path(args.dir)
@@ -140,13 +141,7 @@ def main():
 
     run_counter = 0
     for wm in weather_models:
-        if args.data_file:
-            assert_no_dwr_leakage(args.data_file)
-            df = pd.read_parquet(args.data_file)
-            assert_valid_training_years(df)
-            df = standardize_dataframe_columns(df)
-        else:
-            df = generate_smoke_test_dataset(n_samples=100, weather_model=wm)
+        df = load_training_dataset(data_path_or_str=args.data_file, weather_model=wm)
 
         for ab in ablations:
             run_counter += 1
