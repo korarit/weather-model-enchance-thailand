@@ -25,13 +25,23 @@ import pandas as pd
 
 from src.data.anti_leakage_validator import assert_no_temporal_leakage
 from src.features.spatial_features import SpatialObservationIndexer
+from src.config.paths import (
+    PROJECT_ROOT,
+    DEFAULT_FEATURES_DIR,
+    DEFAULT_GEO_DIR,
+    DEFAULT_HII_META_DIR,
+    DEFAULT_HII_CLEAN_DIR,
+    DEFAULT_RAW_NWP_DIR,
+    DEFAULT_OUT_NWP_DIR,
+    DEFAULT_HIMAWARI_DIR,
+    resolve_hii_paths,
+    resolve_forecast_paths,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-DEFAULT_FEATURES_DIR = PROJECT_ROOT / "data" / "features"
-DEFAULT_GEO_DIR = PROJECT_ROOT / "data" / "geo"
-DEFAULT_META_DIR = PROJECT_ROOT / "data" / "metadata"
+DEFAULT_META_DIR = DEFAULT_HII_META_DIR
 
 
 def load_master_grid(geo_dir: Path = DEFAULT_GEO_DIR) -> pd.DataFrame:
@@ -153,25 +163,32 @@ def assemble_unified_training_matrix(
     return merged
 
 
-def run_sample_builder(output_dir: Path = DEFAULT_FEATURES_DIR) -> Path:
+def run_sample_builder(
+    output_dir: Path = DEFAULT_FEATURES_DIR,
+    geo_dir: Path = DEFAULT_GEO_DIR,
+    hii_meta_dir: Path = DEFAULT_HII_META_DIR,
+    raw_nwp_dir: Path = DEFAULT_RAW_NWP_DIR,
+    out_nwp_dir: Path = DEFAULT_OUT_NWP_DIR,
+    himawari_dir: Path = DEFAULT_HIMAWARI_DIR,
+) -> Path:
     """Executes end-to-end sample feature assembly for dev validation."""
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Running Phase 3 Sample Feature Builder...")
 
-    grid_df = load_master_grid()
-    stn_meta_df = load_stations_metadata()
+    grid_df = load_master_grid(geo_dir=geo_dir)
+    stn_meta_df = load_stations_metadata(meta_dir=hii_meta_dir)
     indexer = SpatialObservationIndexer(stn_meta_df)
 
     # Load or generate sample NWP & Himawari inputs
     from src.data.tigge_extractor import run_extraction_pipeline
-    nwp_files = run_extraction_pipeline()
+    nwp_files = run_extraction_pipeline(raw_dir=raw_nwp_dir, out_dir=out_nwp_dir)
     if nwp_files:
         nwp_df = pd.read_parquet(nwp_files[0])
     else:
         from src.data.tigge_downloader import download_tigge_cycle
-        raw_p = download_tigge_cycle("ecmf", "2021-01-01", "00:00")
+        raw_p = download_tigge_cycle("ecmf", "2021-01-01", "00:00", output_dir=raw_nwp_dir)
         from src.data.tigge_extractor import process_raw_nwp_file
-        nwp_pq = process_raw_nwp_file(raw_p)
+        nwp_pq = process_raw_nwp_file(raw_p, output_base_dir=out_nwp_dir)
         nwp_df = pd.read_parquet(nwp_pq)
 
     run_time = nwp_df["run_time"].iloc[0]
@@ -205,10 +222,38 @@ def run_sample_builder(output_dir: Path = DEFAULT_FEATURES_DIR) -> Path:
 
 def main():
     parser = argparse.ArgumentParser(description="Unified Feature Matrix Builder")
-    parser.add_argument("--output-dir", type=str, default=str(DEFAULT_FEATURES_DIR), help="Output directory")
+    # HII Ground Telemetry arguments
+    parser.add_argument("--hii-dir", type=str, default=None, help="Base directory for HII data (e.g. D:/data/hii)")
+    parser.add_argument("--hii-meta-dir", type=str, default=None, help="HII metadata directory (default: {hii-dir}/metadata or data/metadata)")
+    parser.add_argument("--hii-clean-dir", type=str, default=None, help="HII clean parquet directory (default: {hii-dir}/clean_parquet or data/clean_parquet)")
+
+    # Weather Forecast arguments
+    parser.add_argument("--forecast-dir", "--nwp-dir", dest="forecast_dir", type=str, default=None, help="Base directory for NWP forecast data (e.g. E:/data/weather_nwp)")
+    parser.add_argument("--raw-nwp-dir", type=str, default=None, help="Raw NWP runs directory")
+    parser.add_argument("--out-nwp-dir", type=str, default=None, help="Processed NWP forecasts directory")
+    parser.add_argument("--himawari-dir", type=str, default=None, help="Himawari satellite data directory")
+
+    # Common & Output arguments
+    parser.add_argument("--geo-dir", type=str, default=str(DEFAULT_GEO_DIR), help="Master grid geo directory")
+    parser.add_argument("--output-dir", type=str, default=str(DEFAULT_FEATURES_DIR), help="Output features directory")
     args = parser.parse_args()
 
-    run_sample_builder(output_dir=Path(args.output_dir))
+    hii_paths = resolve_hii_paths(hii_dir=args.hii_dir, meta_dir=args.hii_meta_dir, clean_dir=args.hii_clean_dir)
+    forecast_paths = resolve_forecast_paths(
+        forecast_dir=args.forecast_dir,
+        raw_nwp_dir=args.raw_nwp_dir,
+        out_nwp_dir=args.out_nwp_dir,
+        himawari_dir=args.himawari_dir
+    )
+
+    run_sample_builder(
+        output_dir=Path(args.output_dir),
+        geo_dir=Path(args.geo_dir),
+        hii_meta_dir=hii_paths["meta_dir"],
+        raw_nwp_dir=forecast_paths["raw_nwp_dir"],
+        out_nwp_dir=forecast_paths["out_nwp_dir"],
+        himawari_dir=forecast_paths["himawari_dir"],
+    )
 
 
 if __name__ == "__main__":

@@ -24,10 +24,15 @@ import datetime
 import numpy as np
 import pandas as pd
 
+from src.config.paths import (
+    DEFAULT_HIMAWARI_DIR,
+    resolve_forecast_paths,
+)
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-DEFAULT_HIMAWARI_OUT = PROJECT_ROOT / "data" / "himawari9"
+DEFAULT_HIMAWARI_OUT = DEFAULT_HIMAWARI_DIR
 
 # Thailand Spatial Coordinates Grid (Sample points for dev resolution)
 GRID_LATS = np.arange(5.5, 21.0, 0.5)
@@ -182,15 +187,17 @@ def run_himawari_acquisition(
 
 def main():
     parser = argparse.ArgumentParser(description="Himawari-9 Convective Cloud Feature Extractor")
+    parser.add_argument("--forecast-dir", "--satellite-dir", dest="forecast_dir", type=str, default=None, help="Base directory for forecast/satellite data (e.g. E:/data/weather_nwp)")
+    parser.add_argument("--out-dir", type=str, default=None, help="Output parquet dir (default: {forecast-dir}/himawari9 or data/himawari9)")
     parser.add_argument("--start", type=str, default="2021-01-01 00:00:00", help="Start timestamp")
     parser.add_argument("--sample-hours", type=int, default=6, help="Hours to process in dev mode")
     parser.add_argument("--full", action="store_true", help="Server production full mode")
-    parser.add_argument("--out-dir", type=str, default=str(DEFAULT_HIMAWARI_OUT), help="Output parquet dir")
     args = parser.parse_args()
 
+    paths = resolve_forecast_paths(forecast_dir=args.forecast_dir, himawari_dir=args.out_dir)
     start_dt = pd.Timestamp(args.start)
     hours = args.sample_hours if not args.full else 720
-    run_himawari_acquisition(start_dt=start_dt, sample_hours=hours, out_dir=Path(args.out_dir))
+    run_himawari_acquisition(start_dt=start_dt, sample_hours=hours, out_dir=paths["himawari_dir"])
 
 
 if __name__ == "__main__":

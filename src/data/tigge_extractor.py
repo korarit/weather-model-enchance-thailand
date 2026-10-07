@@ -23,11 +23,14 @@ from typing import Optional, List
 import pandas as pd
 import numpy as np
 
+from src.config.paths import (
+    DEFAULT_RAW_NWP_DIR,
+    DEFAULT_OUT_NWP_DIR,
+    resolve_forecast_paths,
+)
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-DEFAULT_RAW_NWP_DIR = PROJECT_ROOT / "data" / "raw" / "nwp_runs"
-DEFAULT_OUT_NWP_DIR = PROJECT_ROOT / "data" / "nwp_forecasts"
 
 
 def normalize_nwp_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -135,11 +138,13 @@ def run_extraction_pipeline(raw_dir: Path = DEFAULT_RAW_NWP_DIR, out_dir: Path =
 
 def main():
     parser = argparse.ArgumentParser(description="TIGGE NWP Analysis-Ready Extractor")
-    parser.add_argument("--raw-dir", type=str, default=str(DEFAULT_RAW_NWP_DIR), help="Input raw NWP dir")
-    parser.add_argument("--out-dir", type=str, default=str(DEFAULT_OUT_NWP_DIR), help="Output parquet dir")
+    parser.add_argument("--forecast-dir", "--nwp-dir", dest="forecast_dir", type=str, default=None, help="Base directory for NWP forecast data (e.g. E:/data/weather_nwp)")
+    parser.add_argument("--raw-dir", type=str, default=None, help="Input raw NWP dir (default: {forecast-dir}/raw/nwp_runs or data/raw/nwp_runs)")
+    parser.add_argument("--out-dir", type=str, default=None, help="Output parquet dir (default: {forecast-dir}/nwp_forecasts or data/nwp_forecasts)")
     args = parser.parse_args()
 
-    run_extraction_pipeline(raw_dir=Path(args.raw_dir), out_dir=Path(args.out_dir))
+    paths = resolve_forecast_paths(forecast_dir=args.forecast_dir, raw_nwp_dir=args.raw_dir, out_nwp_dir=args.out_dir)
+    run_extraction_pipeline(raw_dir=paths["raw_nwp_dir"], out_dir=paths["out_nwp_dir"])
 
 
 if __name__ == "__main__":

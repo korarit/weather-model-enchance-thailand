@@ -30,13 +30,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from src.data.hii_parser import detect_and_normalize_csv, audit_station_records
+from src.config.paths import (
+    PROJECT_ROOT,
+    DEFAULT_HII_AUDIT_DIR,
+    DEFAULT_HII_META_DIR,
+    resolve_hii_paths,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_AUDIT_DIR = PROJECT_ROOT / "data" / "audit"
-DEFAULT_META_DIR = PROJECT_ROOT / "data" / "metadata"
+DEFAULT_AUDIT_DIR = DEFAULT_HII_AUDIT_DIR
+DEFAULT_META_DIR = DEFAULT_HII_META_DIR
 
 CATALOG_BASE_URLS = {
     "hourly_rain": "https://tiservice.hii.or.th/opendata/data_catalog/hourly_rain",
@@ -152,9 +157,9 @@ def inspect_station_deep(
     return cleaned_df, metrics
 
 
-def load_metadata() -> pd.DataFrame:
+def load_metadata(meta_dir: Path = DEFAULT_META_DIR) -> pd.DataFrame:
     """Loads station master metadata if available."""
-    meta_path = DEFAULT_META_DIR / "hii_stations_master_metadata.csv"
+    meta_path = meta_dir / "hii_stations_master_metadata.csv"
     if meta_path.exists():
         return pd.read_csv(meta_path)
     return pd.DataFrame()
@@ -351,6 +356,7 @@ def run_audit(
     months: List[str] = None,
     catalogs: List[str] = None,
     output_dir: Path = DEFAULT_AUDIT_DIR,
+    meta_dir: Path = DEFAULT_META_DIR,
     max_workers: int = 8
 ):
     """Main audit execution controller."""
@@ -363,7 +369,7 @@ def run_audit(
     logger.info("Starting HII Audit [mode=%s, catalogs=%s, months=%d]", mode, catalogs, len(months))
 
     # Load master metadata
-    metadata_df = load_metadata()
+    metadata_df = load_metadata(meta_dir=meta_dir)
     meta_summary = {
         "total_stations": len(metadata_df) if not metadata_df.empty else 1396
     }
@@ -481,17 +487,22 @@ def run_audit(
 
 def main():
     parser = argparse.ArgumentParser(description="HII Ground Data Acquisition & Completeness Audit")
+    parser.add_argument("--hii-dir", type=str, default=None, help="Base directory for HII data (e.g. D:/data/hii)")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output audit directory (default: {hii-dir}/audit or data/audit)")
+    parser.add_argument("--meta-dir", type=str, default=None, help="HII metadata directory (default: {hii-dir}/metadata or data/metadata)")
     parser.add_argument("--mode", choices=["sample", "full"], default="sample", help="Mode: sample (Dev) or full (Prod)")
     parser.add_argument("--limit-stations", type=int, default=5, help="Number of stations to inspect in sample mode")
     parser.add_argument("--months", nargs="+", help="Specific months (e.g. 202101 202102) or default all 60")
     parser.add_argument("--all-catalogs", action="store_true", help="Audit all 3 catalogs")
-    parser.add_argument("--output-dir", type=str, default=str(DEFAULT_AUDIT_DIR), help="Output directory")
     parser.add_argument("--max-workers", type=int, default=8, help="Concurrency workers")
     args = parser.parse_args()
 
+    paths = resolve_hii_paths(hii_dir=args.hii_dir, audit_dir=args.output_dir, meta_dir=args.meta_dir)
+    output_dir = paths["audit_dir"]
+    meta_dir = paths["meta_dir"]
+
     months = args.months if args.months else ALL_60_MONTHS
     catalogs = ["hourly_rain", "pressure", "humidity"]
-    output_dir = Path(args.output_dir)
 
     run_audit(
         mode=args.mode,
@@ -499,6 +510,7 @@ def main():
         months=months,
         catalogs=catalogs,
         output_dir=output_dir,
+        meta_dir=meta_dir,
         max_workers=args.max_workers
     )
 

@@ -28,10 +28,15 @@ import datetime
 import numpy as np
 import pandas as pd
 
+from src.config.paths import (
+    DEFAULT_RAW_NWP_DIR,
+    resolve_forecast_paths,
+)
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-DEFAULT_RAW_DIR = PROJECT_ROOT / "data" / "raw" / "nwp_runs"
+DEFAULT_RAW_DIR = DEFAULT_RAW_NWP_DIR
 
 TIGGE_ORIGINS = {
     "ecmf": "ECMWF IFS (Europe)",
@@ -215,13 +220,17 @@ def run_batch_acquisition(
 
 def main():
     parser = argparse.ArgumentParser(description="TIGGE NWP Forecast Cycles Downloader")
+    parser.add_argument("--forecast-dir", "--nwp-dir", dest="forecast_dir", type=str, default=None, help="Base directory for NWP forecast data (e.g. E:/data/weather_nwp)")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output raw directory (default: {forecast-dir}/raw/nwp_runs or data/raw/nwp_runs)")
     parser.add_argument("--sample-days", type=int, default=2, help="Sample days for dev mode")
     parser.add_argument("--start", type=str, default="2021-01-01", help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
     parser.add_argument("--origins", type=str, default="ecmf,kwbc", help="Comma-separated TIGGE origins (e.g. ecmf,kwbc,cwao)")
     parser.add_argument("--full", action="store_true", help="Run full multi-year download (Server production)")
-    parser.add_argument("--output-dir", type=str, default=str(DEFAULT_RAW_DIR), help="Output directory")
     args = parser.parse_args()
+
+    paths = resolve_forecast_paths(forecast_dir=args.forecast_dir, raw_nwp_dir=args.output_dir)
+    output_dir = paths["raw_nwp_dir"]
 
     origin_list = [o.strip() for o in args.origins.split(",") if o.strip() in TIGGE_ORIGINS]
     if not origin_list:
@@ -234,7 +243,7 @@ def main():
     else:
         days = pd.date_range(start_date, periods=args.sample_days, freq="D").strftime("%Y-%m-%d").tolist()
 
-    run_batch_acquisition(days, origin_list, output_dir=Path(args.output_dir))
+    run_batch_acquisition(days, origin_list, output_dir=output_dir)
 
 
 if __name__ == "__main__":

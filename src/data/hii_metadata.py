@@ -14,8 +14,14 @@ import urllib.request
 import pandas as pd
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+from src.config.paths import DEFAULT_HII_META_DIR, resolve_hii_paths
 
 CATALOG_URLS = {
     "hourly_rain": "https://tiservice.hii.or.th/opendata/data_catalog/hourly_rain/0all_stn_metadata.csv",
@@ -23,7 +29,7 @@ CATALOG_URLS = {
     "humidity": "https://tiservice.hii.or.th/opendata/data_catalog/humidity/0all_stn_metadata.csv",
 }
 
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "metadata"
+DEFAULT_OUTPUT_DIR = DEFAULT_HII_META_DIR
 
 
 def fetch_metadata_df(catalog_name: str, url: str) -> pd.DataFrame:
@@ -139,6 +145,15 @@ def build_master_metadata(output_dir: Path = DEFAULT_OUTPUT_DIR) -> dict:
 
 
 if __name__ == "__main__":
-    summary = build_master_metadata()
+    import argparse
+    parser = argparse.ArgumentParser(description="HII Station Metadata Acquisition & Cross-Mapping")
+    parser.add_argument("--hii-dir", type=str, default=None, help="Base directory for HII data (e.g. D:/data/hii)")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output metadata directory (default: {hii-dir}/metadata or data/metadata)")
+    args = parser.parse_args()
+
+    paths = resolve_hii_paths(hii_dir=args.hii_dir, meta_dir=args.output_dir)
+    target_out = paths["meta_dir"]
+
+    summary = build_master_metadata(output_dir=target_out)
     print("Metadata generation complete:")
     print(json.dumps(summary, indent=2))

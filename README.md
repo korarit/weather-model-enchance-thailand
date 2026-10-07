@@ -153,7 +153,111 @@ pip install numpy pandas scipy matplotlib lightgbm catboost torch pyproj pyarrow
 
 ---
 
-### 2. Phase 1 & 2: การตรวจสอบสถานีและป้องกันข้อมูลรั่วไหล (Data Ingestion & Audit)
+### 2. การตั้งค่าไดเรกทอรี HII Data แยกอิสระและการรันแบบ Full Pipeline (Decoupled HII Data & Full Pipeline)
+
+เนื่องจากชุดข้อมูลภาคพื้นดินของ **HII (2021–2025)** และข้อมูลพยากรณ์อากาศ **ECMWF NWP / Himawari-9 Satellite** มีขนาดใหญ่ ระบบจึงถูกออกแบบให้สามารถ**แยกที่จัดเก็บข้อมูลออกจากโฟลเดอร์โปรเจกต์** (เช่น เก็บไว้ใน External SSD, NAS หรือไดรฟ์อื่น เช่น `D:/data/hii` และ `E:/data/nwp`) ผ่าน **CLI Arguments เป็นหลัก** หรือผ่าน **Environment Variables**
+
+#### โครงสร้างไดเรกทอรี HII ที่ระบบสร้างและเรียกใช้งาน:
+```text
+<HII_DIR>/ (ตัวอย่าง: D:/data/hii)
+├── metadata/                  # ข้อมูลพิกัดและลุ่มน้ำของสถานี HII (สร้างโดย hii_metadata.py)
+│   ├── hii_stations_master_metadata.csv
+│   └── hii_stations_cross_mapping.json
+├── clean_parquet/             # ไฟล์ Parquet ที่คลีนและแบ่งพาร์ทิชันแล้ว (สร้างโดย hii_downloader.py)
+│   ├── hourly_rain/year=YYYY/
+│   ├── pressure/year=YYYY/
+│   └── humidity/year=YYYY/
+└── audit/                     # รายงานการประเมินคุณภาพสถานี Zero-Null (สร้างโดย hii_audit.py)
+    ├── golden_stations_zero_null_2021_2025.csv
+    └── all_stations_completeness_matrix.csv
+```
+
+#### 🔄 ขั้นตอนการรันแบบ Full Pipeline เมื่อกำหนด HII Directory แยกต่างหาก
+
+หากต้องการกำหนดที่อยู่ของ HII Data ไปยังไดเรกทอรีใหม่ (เช่น `D:/data/hii`) ให้ปฏิบัติตามลำดับขั้นตอนดังนี้:
+
+##### ขั้นตอนที่ 1: ดึงและสร้าง Metadata ของสถานี HII ทั้งหมด
+สร้าง Master Metadata และ Cross-mapping JSON ลงใน `<HII_DIR>/metadata`:
+```bash
+python src/data/hii_metadata.py --hii-dir "D:/data/hii"
+```
+
+##### ขั้นตอนที่ 2: ดาวน์โหลดและแปลงข้อมูล HII เป็น Clean Parquet
+ดึงข้อมูลฝน ความกดอากาศ และความชื้น จาก HII Open Data Catalog แล้วแปลงเป็น Parquet พร้อมจัดหมวดหมู่:
+```bash
+# โหมด Dev Sample (5 สถานีตัวอย่างสำหรับการทดสอบระบบ):
+python src/data/hii_downloader.py --hii-dir "D:/data/hii" --sample
+
+# โหมด Production Full (ดึงครบ 60 เดือน 2021-2025 ทุกสถานี):
+python src/data/hii_downloader.py --hii-dir "D:/data/hii" --full --years 2021 2022 2023 2024 2025
+```
+
+##### ขั้นตอนที่ 3: ตรวจสอบความสมบูรณ์และคัดกรองสถานี Golden (Audit)
+วิเคราะห์สถานีที่ข้อมูลครบ 60 เดือนและไม่มีแถว Null แม้แต่แถวเดียว (Zero-Null):
+```bash
+python src/data/hii_audit.py --hii-dir "D:/data/hii" --mode sample
+```
+
+##### ขั้นตอนที่ 4: ดาวน์โหลดและสกัดข้อมูลพยากรณ์อากาศโลก (NWP) และดาวเทียม
+(สามารถระบุ `--forecast-dir` ไปยังไดรฟ์อื่น เช่น `E:/data/nwp` ได้อย่างอิสระ):
+```bash
+# 4.1 ดาวน์โหลดและแปลง NWP Forecast Cycles (ECMWF, NCEP GFS)
+python src/data/tigge_downloader.py --forecast-dir "E:/data/nwp" --sample-days 2
+python src/data/tigge_extractor.py --forecast-dir "E:/data/nwp"
+
+# 4.2 สกัดฟีเจอร์การพัฒนาตัวของกลุ่มเมฆจากดาวเทียม Himawari-9
+python src/data/himawari_extractor.py --forecast-dir "E:/data/nwp" --sample-hours 6
+```
+
+##### ขั้นตอนที่ 5: สร้าง Master Grid 2 km และรวมฟีเจอร์เข้า Matrix (Multi-Modal Feature Assembly)
+รวมข้อมูล HII Ground Obs เข้ากับ NWP Forecast และ Satellite Features โดยชี้พาธแยกกัน:
+```bash
+# 5.1 สร้าง 2 km National Grid
+python src/features/grid_generator.py
+
+# 5.2 รัน Feature Builder ชี้ทั้ง HII และ Forecast จากพาธที่ตั้งไว้
+python src/features/feature_builder.py \
+  --hii-dir "D:/data/hii" \
+  --forecast-dir "E:/data/nwp" \
+  --output-dir "data/features"
+```
+
+##### ขั้นตอนที่ 6: ฝึกสอนโมเดล Bias Correction ด้วยฟีเจอร์ที่สร้างขึ้น
+ส่งต่อไฟล์ Feature Parquet เข้าสู่ Model Runners:
+```bash
+python src/models/runners/run_catboost.py \
+  --data-file "data/features/training_features_<TIMESTAMP>.parquet" \
+  --weather-model ecmwf_ifs \
+  --ablation m3
+
+# หรือฝึกสอนด้วยโมเดล LightGBM, Hurdle, Multi-Quantile, ST-GNN, U-Net
+python src/models/runners/run_lightgbm.py \
+  --data-file "data/features/training_features_<TIMESTAMP>.parquet" \
+  --weather-model ecmwf_ifs \
+  --ablation m3
+```
+
+##### ขั้นตอนที่ 7: ประเมินผล Hydrological Benchmark และสร้างรายงาน
+```bash
+python src/evaluation/run_evaluation.py --dir outputs/benchmark_2025/ --smoke-test
+python src/evaluation/generate_benchmark_charts.py --dir outputs/benchmark_2025/
+```
+
+---
+
+#### 💡 ทางเลือกเสริม: ตั้งค่าผ่าน Environment Variables (`.env`)
+หากไม่ต้องการระบุ `--hii-dir` ในทุกคำสั่ง สามารถคัดลอกไฟล์ `.env.example` เป็น `.env` แล้วระบุค่าไว้ล่วงหน้า ระบบจะอ่านค่าพาธเหล่านี้เป็นค่าเริ่มต้นให้อัตโนมัติ:
+```env
+# ตั้งค่าพาธสำหรับ HII data (แยกไดรฟ์/โฟลเดอร์ได้)
+HII_DATA_DIR="D:/data/hii"
+
+# ตั้งค่าพาธสำหรับ Weather Forecast / Satellite data
+FORECAST_DATA_DIR="E:/data/nwp"
+```
+
+---
+
+### 3. Phase 1 & 2: การตรวจสอบสถานีและป้องกันข้อมูลรั่วไหล (Data Ingestion & Audit)
 
 ตรวจสอบความถูกต้องของพิกัดและแบ่งเกรดสถานี HII (Golden, Silver, Bronze):
 ```bash
@@ -166,7 +270,7 @@ python src/data/anti_leakage_validator.py
 
 ---
 
-### 3. Phase 3: การสร้าง 2 km National Grid และฟีเจอร์เชิงพื้นที่ (Spatial Features Engine)
+### 4. Phase 3: การสร้าง 2 km National Grid และฟีเจอร์เชิงพื้นที่ (Spatial Features Engine)
 
 สร้างตารางกริด 2 km ทั่วประเทศ 69,121 เซลล์ และทดสอบการสร้างฟีเจอร์ 49 ตัวแปร:
 ```bash
@@ -182,7 +286,7 @@ python src/features/feature_builder.py
 
 ---
 
-### 4. Phase 4: การรันและฝึกสอนโมเดล (Multi-NWP Model Training Protocol)
+### 5. Phase 4: การรันและฝึกสอนโมเดล (Multi-NWP Model Training Protocol)
 
 ระบบรองรับการรันแบบ Decoupled แยกตามสถาปัตยกรรมและแยกตาม **Weather Model เป้าหมาย** (`ecmwf_ifs`, `ncep_gfs`, `dwd_icon` หรือระบุ `--weather-model all` เพื่อฝึกทุกโมเดลสภาพอากาศพร้อมกัน):
 
@@ -214,7 +318,7 @@ python src/models/runners/run_unet.py --weather-model all --ablation m3 --smoke-
 
 ---
 
-### 5. Phase 5: การประเมินผลและการสร้างชุดกราฟเส้นรายเดือน (Hydrological Evaluation & Charts)
+### 6. Phase 5: การประเมินผลและการสร้างชุดกราฟเส้นรายเดือน (Hydrological Evaluation & Charts)
 
 รันไปป์ไลน์การประเมินผลแบบครบวงจร (สามารถกำหนดโฟลเดอร์ปลายทางได้ด้วย `--dir`):
 

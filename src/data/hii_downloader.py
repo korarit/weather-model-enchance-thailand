@@ -30,13 +30,18 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from src.data.hii_parser import detect_and_normalize_csv, audit_station_records
+from src.config.paths import (
+    PROJECT_ROOT,
+    DEFAULT_HII_CLEAN_DIR,
+    DEFAULT_HII_AUDIT_DIR,
+    resolve_hii_paths,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_CLEAN_DIR = PROJECT_ROOT / "data" / "clean_parquet"
-DEFAULT_AUDIT_DIR = PROJECT_ROOT / "data" / "audit"
+DEFAULT_CLEAN_DIR = DEFAULT_HII_CLEAN_DIR
+DEFAULT_AUDIT_DIR = DEFAULT_HII_AUDIT_DIR
 
 CATALOG_BASE_URLS = {
     "hourly_rain": "https://tiservice.hii.or.th/opendata/data_catalog/hourly_rain",
@@ -178,14 +183,19 @@ def get_candidate_stations(sample_count: int = 5) -> List[str]:
 
 def main():
     parser = argparse.ArgumentParser(description="HII Clean Parquet Downloader")
+    parser.add_argument("--hii-dir", type=str, default=None, help="Base directory for HII data (e.g. D:/data/hii)")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output parquet directory (default: {hii-dir}/clean_parquet or data/clean_parquet)")
     parser.add_argument("--sample", action="store_true", help="Dev sample mode (limited stations)")
     parser.add_argument("--full", action="store_true", help="Production full mode")
     parser.add_argument("--stations", nargs="+", help="Station code(s) or number of stations")
     parser.add_argument("--years", nargs="+", type=int, default=[2021, 2025], help="Years to acquire (e.g. 2021 2025 or 2021 2022 2023 2024 2025)")
     parser.add_argument("--all-catalogs", action="store_true", help="Download all 3 catalogs")
-    parser.add_argument("--output-dir", type=str, default=str(DEFAULT_CLEAN_DIR), help="Output parquet directory")
     parser.add_argument("--max-workers", type=int, default=4, help="Concurrency workers")
     args = parser.parse_args()
+
+    # Determine paths via centralized resolver
+    paths = resolve_hii_paths(hii_dir=args.hii_dir, clean_dir=args.output_dir)
+    output_dir = paths["clean_dir"]
 
     # Determine stations
     if args.stations:
@@ -200,7 +210,6 @@ def main():
 
     catalogs = ["hourly_rain", "pressure", "humidity"]
     years = args.years if args.years else [2021, 2025]
-    output_dir = Path(args.output_dir)
 
     download_clean_data(
         stations=stations,
