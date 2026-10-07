@@ -1,0 +1,24 @@
+experiment_id: ECMWF_IFS_LINKNET_M1
+weather_model: ecmwf_ifs
+model_name: linknet
+ablation_variant: m1
+variant_description: '[ECMWF_IFS] NWP + Topo + Ground Telemetry'
+data:
+  train_years:
+  - 2021
+  - 2022
+  - 2023
+  - 2024
+  val_years:
+  - 2024
+  frozen_test_year: 2025
+  target_column: target_bias
+  nwp_rain_column: nwp_rain_raw
+model_type: spatial_linknet
+objective: huber_loss
+hyperparameters:
+  epochs: 40
+  batch_size: 32
+  hidden_dim: 32
+  lr: 0.005
+  weight_decay: 0.0001

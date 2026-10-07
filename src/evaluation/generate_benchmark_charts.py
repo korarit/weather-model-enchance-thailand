@@ -44,6 +44,8 @@ MODEL_COLORS = {
     "quantile": "#d62728",
     "stgnn": "#9467bd",
     "unet": "#17becf",
+    "linknet": "#e377c2",
+    "fpn": "#bcbd22",
 }
 
 # Weather model palette & styles for Raw and M1, M2, M3

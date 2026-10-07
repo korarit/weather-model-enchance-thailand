@@ -49,7 +49,7 @@ THAI_25_BASINS = [
     (23, "Songkhla Lake"), (24, "Pattani"), (25, "Peninsula-West")
 ]
 
-MODEL_ARCHITECTURES = ["lightgbm", "catboost", "hurdle", "quantile", "stgnn", "unet"]
+MODEL_ARCHITECTURES = ["lightgbm", "catboost", "hurdle", "quantile", "stgnn", "unet", "linknet", "fpn"]
 ABLATION_VARIANTS = ["m1", "m2", "m3"]
 
 
@@ -59,7 +59,7 @@ def generate_benchmark_data(
     random_seed: int = 42
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Generates realistic 2025 benchmark verification dataset for 18 model variants + Raw NWP B0.
+    Generates realistic 2025 benchmark verification dataset for 24 model variants + Raw NWP B0.
     Simulates:
     - 12 months (Jan-Dec 2025) with authentic Thai seasonal rain patterns (Dry, Pre-Monsoon, Wet)
     - 24 lead times (+1h to +24h)
@@ -78,7 +78,7 @@ def generate_benchmark_data(
     # Model relative skill factors (RMSE reduction relative to raw IFS)
     # Architecture characteristics:
     # Hurdle & CatBoost excel in extreme precipitation (heavy rain POD)
-    # U-Net & ST-GNN excel in spatial continuity and longer lead times
+    # U-Net, LinkNet, FPN & ST-GNN excel in spatial continuity and multi-scale topography
     # M3 (NWP + Ground + Himawari-9) > M2 (NWP + Himawari-9) > M1 (NWP + Ground) > B0 (Raw NWP)
     model_skill_weights = {
         "lightgbm": {"m1": 0.22, "m2": 0.18, "m3": 0.28},
@@ -87,6 +87,8 @@ def generate_benchmark_data(
         "quantile": {"m1": 0.23, "m2": 0.19, "m3": 0.29},
         "stgnn":    {"m1": 0.25, "m2": 0.21, "m3": 0.32},
         "unet":     {"m1": 0.27, "m2": 0.23, "m3": 0.35},
+        "linknet":  {"m1": 0.26, "m2": 0.22, "m3": 0.34},
+        "fpn":      {"m1": 0.28, "m2": 0.24, "m3": 0.36},
     }
 
     # Station sets

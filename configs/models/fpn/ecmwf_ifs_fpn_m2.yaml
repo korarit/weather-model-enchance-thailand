@@ -1,0 +1,25 @@
+experiment_id: ECMWF_IFS_FPN_M2
+weather_model: ecmwf_ifs
+model_name: fpn
+ablation_variant: m2
+variant_description: '[ECMWF_IFS] NWP + Topo + Himawari-9 Satellite'
+data:
+  train_years:
+  - 2021
+  - 2022
+  - 2023
+  - 2024
+  val_years:
+  - 2024
+  frozen_test_year: 2025
+  target_column: target_bias
+  nwp_rain_column: nwp_rain_raw
+model_type: spatial_fpn
+objective: huber_loss
+hyperparameters:
+  epochs: 40
+  batch_size: 32
+  hidden_dim: 32
+  pyramid_channels: 24
+  lr: 0.005
+  weight_decay: 0.0001

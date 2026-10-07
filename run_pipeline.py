@@ -187,6 +187,16 @@ def run_full_pipeline(
         for wm in target_models:
             for ab in target_ablations:
                 train_and_eval_unet(df_features, ab, output_dir=model_output_dir, weather_model=wm, smoke_test=smoke_test)
+    elif model_name == "linknet":
+        from src.models.runners.run_linknet import train_and_eval_linknet
+        for wm in target_models:
+            for ab in target_ablations:
+                train_and_eval_linknet(df_features, ab, output_dir=model_output_dir, weather_model=wm, smoke_test=smoke_test)
+    elif model_name == "fpn":
+        from src.models.runners.run_fpn import train_and_eval_fpn
+        for wm in target_models:
+            for ab in target_ablations:
+                train_and_eval_fpn(df_features, ab, output_dir=model_output_dir, weather_model=wm, smoke_test=smoke_test)
 
     # -------------------------------------------------------------------------
     # STAGE 6: Hydrological Evaluation Benchmark Suite
@@ -209,7 +219,7 @@ def main():
     parser.add_argument("--hii-dir", type=str, default=None, help="Base directory for HII data (e.g. D:/data/hii)")
     parser.add_argument("--forecast-dir", "--nwp-dir", dest="forecast_dir", type=str, default=None, help="Base directory for NWP forecast data (e.g. E:/data/weather_nwp)")
     parser.add_argument("--output-dir", type=str, default="outputs/pipeline_run", help="Output directory")
-    parser.add_argument("--model", choices=["catboost", "lightgbm", "hurdle", "quantile", "stgnn", "unet"], default="catboost", help="ML Architecture")
+    parser.add_argument("--model", choices=["catboost", "lightgbm", "hurdle", "quantile", "stgnn", "unet", "linknet", "fpn"], default="catboost", help="ML Architecture")
     parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "meteo_arpege", "all"], default="ecmwf_ifs", help="Target Weather Model")
     parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default="m1", help="Feature ablation variant")
     parser.add_argument("--smoke-test", action="store_true", default=True, help="Fast smoke test mode")

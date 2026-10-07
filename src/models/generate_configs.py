@@ -73,6 +73,29 @@ MODELS = {
             "lr": 0.005,
             "weight_decay": 1e-4,
         }
+    },
+    "linknet": {
+        "model_type": "spatial_linknet",
+        "objective": "huber_loss",
+        "hyperparameters": {
+            "epochs": 40,
+            "batch_size": 32,
+            "hidden_dim": 32,
+            "lr": 0.005,
+            "weight_decay": 1e-4,
+        }
+    },
+    "fpn": {
+        "model_type": "spatial_fpn",
+        "objective": "huber_loss",
+        "hyperparameters": {
+            "epochs": 40,
+            "batch_size": 32,
+            "hidden_dim": 32,
+            "pyramid_channels": 24,
+            "lr": 0.005,
+            "weight_decay": 1e-4,
+        }
     }
 }
 
