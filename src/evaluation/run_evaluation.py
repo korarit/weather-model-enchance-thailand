@@ -157,7 +157,7 @@ def generate_benchmark_data(
             raw_icon_rain = max(0.0, float(round(obs_rain * 0.72 + np.random.normal(0.45, 2.0 * lead_degradation_factor), 2)))
             raw_gem_rain = max(0.0, float(round(obs_rain * 0.68 + np.random.normal(0.55, 2.2 * lead_degradation_factor), 2)))
             raw_access_rain = max(0.0, float(round(obs_rain * 0.69 + np.random.normal(0.52, 2.15 * lead_degradation_factor), 2)))
-            raw_arpege_rain = max(0.0, float(round(obs_rain * 0.67 + np.random.normal(0.58, 2.3 * lead_degradation_factor), 2)))
+
 
             # Bias-Corrected GFS (M3): Proves whether ML-corrected GFS can outperform raw ECMWF IFS
             gfs_eff_skill = max(0.05, 0.32 - (lead_time / 24.0) * 0.08)
@@ -195,7 +195,6 @@ def generate_benchmark_data(
                 "raw_dwd_icon_pred": raw_icon_rain,
                 "raw_cmc_gem_pred": raw_gem_rain,
                 "raw_bom_access_pred": raw_access_rain,
-                "raw_meteo_arpege_pred": raw_arpege_rain,
                 "gfs_corrected_m3_pred": gfs_corr_rain,
                 "is_holdout": 0,
             }
@@ -352,7 +351,6 @@ def run_comprehensive_evaluation(output_dir: Path, smoke_test: bool = True):
         ("dwd_icon_m3", "dwd_icon_m3_pred", "Germany+ML", "dwd_icon", "m3"),
         ("raw_cmc_gem", "raw_cmc_gem_pred", "Canada", "cmc_gem", "raw"),
         ("raw_bom_access", "raw_bom_access_pred", "Australia", "bom_access", "raw"),
-        ("raw_meteo_arpege", "raw_meteo_arpege_pred", "France", "meteo_arpege", "raw"),
     ]
 
     raw_comparison_table = []

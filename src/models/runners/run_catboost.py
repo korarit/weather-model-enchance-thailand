@@ -123,7 +123,7 @@ def train_and_eval_catboost(
 
 def main():
     parser = argparse.ArgumentParser(description="CatBoost Bias Correction Runner")
-    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "meteo_arpege", "all"], default=None, help="Target Weather Model (or 'all')")
+    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "all"], default=None, help="Target Weather Model (or 'all')")
     parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default=None, help="Feature ablation variant")
     parser.add_argument("--smoke-test", action="store_true", help="Run rapid smoke test on PC")
     parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/catboost/", help="Base output directory")

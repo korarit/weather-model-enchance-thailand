@@ -39,9 +39,6 @@ TIGGE_ORIGINS = {
     "bom": "BoM ACCESS-G (Australia)",
     "edzw": "DWD ICON Global (Germany)",
     "dwd": "DWD ICON Global (Germany)",
-    "lfpw": "Météo-France ARPEGE (France)",
-    "mf": "Météo-France ARPEGE (France)",
-    "meteo_france": "Météo-France ARPEGE (France)",
 }
 
 CDS_ORIGIN_MAP = {
@@ -56,9 +53,6 @@ CDS_ORIGIN_MAP = {
     "bom": "bom",
     "edzw": "dwd",
     "dwd": "dwd",
-    "lfpw": "mf",
-    "mf": "mf",
-    "meteo_france": "mf",
 }
 
 # Thailand Bounding Box [North, West, South, East]

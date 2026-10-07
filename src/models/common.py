@@ -159,7 +159,7 @@ def get_train_val_split(
 
 
 SUPPORTED_WEATHER_MODELS = [
-    "ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "meteo_arpege"
+    "ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access"
 ]
 
 
@@ -183,7 +183,6 @@ def generate_smoke_test_dataset(
         "dwd_icon": 0.45,
         "cmc_gem": 0.60,
         "bom_access": 0.50,
-        "meteo_arpege": 0.55,
     }.get(weather_model, 0.4)
 
     for i in range(n_samples):

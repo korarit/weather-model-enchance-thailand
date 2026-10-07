@@ -220,7 +220,7 @@ def main():
     parser.add_argument("--forecast-dir", "--nwp-dir", dest="forecast_dir", type=str, default=None, help="Base directory for NWP forecast data (e.g. E:/data/weather_nwp)")
     parser.add_argument("--output-dir", type=str, default="outputs/pipeline_run", help="Output directory")
     parser.add_argument("--model", choices=["catboost", "lightgbm", "hurdle", "quantile", "stgnn", "unet", "linknet", "fpn"], default="catboost", help="ML Architecture")
-    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "meteo_arpege", "all"], default="ecmwf_ifs", help="Target Weather Model")
+    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "all"], default="ecmwf_ifs", help="Target Weather Model")
     parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default="m1", help="Feature ablation variant")
     parser.add_argument("--smoke-test", action="store_true", default=True, help="Fast smoke test mode")
     parser.add_argument("--full", action="store_true", help="Production full mode (disables smoke-test)")
