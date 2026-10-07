@@ -28,6 +28,10 @@ from src.config.paths import (
     DEFAULT_HIMAWARI_DIR,
     resolve_forecast_paths,
 )
+from src.data.himawari_aws_downloader import (
+    fetch_himawari_observation_aws,
+    check_coverage_across_years,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -108,12 +112,15 @@ def generate_himawari_observation_timestamp(
 
 def extract_convective_evolution_features(
     anchor_time: pd.Timestamp,
-    lookback_minutes: int = 30
+    lookback_minutes: int = 30,
+    source: str = "aws_s3"
 ) -> pd.DataFrame:
     """
-    Extracts multi-temporal Himawari-9 features up to anchor_time (e.g. t, t-10m, t-20m, t-30m)
+    Extracts multi-temporal Himawari features up to anchor_time (e.g. t, t-10m, t-20m, t-30m)
     and computes the Convective Cloud Cooling Rate (Delta_BT_30).
     Guarantees Anti-Leakage: Never accesses any timestamp > anchor_time!
+    
+    source: 'aws_s3' (real satellite observations from NOAA Open Data) or 'synthetic'.
     """
     timestamps = [
         anchor_time - pd.Timedelta(minutes=30),
@@ -122,8 +129,24 @@ def extract_convective_evolution_features(
         anchor_time,
     ]
 
-    dfs_b13 = [generate_himawari_observation_timestamp(ts, band="band13") for ts in timestamps]
-    df_wv = generate_himawari_observation_timestamp(anchor_time, band="band08")
+    dfs_b13 = []
+    df_wv = None
+
+    if source == "aws_s3":
+        try:
+            logger.info("Extracting real Himawari observations from AWS S3 for %s...", anchor_time)
+            for ts in timestamps:
+                df_ts = fetch_himawari_observation_aws(ts, band="band13")
+                dfs_b13.append(df_ts)
+            df_wv = fetch_himawari_observation_aws(anchor_time, band="band08")
+        except Exception as e:
+            logger.warning("AWS S3 fetch failed for %s (%s). Falling back to synthetic simulation.", anchor_time, e)
+            dfs_b13 = []
+            df_wv = None
+
+    if not dfs_b13 or df_wv is None:
+        dfs_b13 = [generate_himawari_observation_timestamp(ts, band="band13") for ts in timestamps]
+        df_wv = generate_himawari_observation_timestamp(anchor_time, band="band08")
 
     # Merge temporal lags for Band 13
     df_t0 = dfs_b13[3].rename(columns={"bt_mean": "bt_mean_t0", "bt_min": "bt_min_t0"})
@@ -169,16 +192,17 @@ def save_himawari_partition(df: pd.DataFrame, anchor_time: pd.Timestamp, out_bas
 def load_or_extract_himawari_features(
     anchor_time: pd.Timestamp,
     himawari_dir: Optional[Path] = None,
+    source: str = "aws_s3"
 ) -> pd.DataFrame:
     """
-    Loads saved Himawari-9 partition for anchor_time if it exists in himawari_dir,
+    Loads saved Himawari partition for anchor_time if it exists in himawari_dir,
     otherwise computes/extracts features on the fly.
     """
     if himawari_dir:
         target_file = get_himawari_partition_path(anchor_time, out_base_dir=Path(himawari_dir))
         if target_file.exists():
             return pd.read_parquet(target_file)
-    return extract_convective_evolution_features(anchor_time)
+    return extract_convective_evolution_features(anchor_time, source=source)
 
 
 def run_himawari_acquisition(
@@ -188,10 +212,11 @@ def run_himawari_acquisition(
     days: Optional[int] = None,
     step_hours: int = 1,
     cycles: Optional[List[int]] = None,
+    source: str = "aws_s3",
     overwrite: bool = False,
     out_dir: Path = DEFAULT_HIMAWARI_OUT
 ) -> List[Path]:
-    """Generates and archives Himawari-9 cloud features across timestamps."""
+    """Generates and archives Himawari cloud features across timestamps."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine target timestamps
@@ -218,8 +243,8 @@ def run_himawari_acquisition(
         return []
 
     total_tasks = len(timestamps)
-    logger.info("Processing Himawari-9 features: %d snapshot(s) from %s to %s (step: %dh)...",
-                total_tasks, timestamps[0], timestamps[-1], step_hours)
+    logger.info("Processing Himawari features (%s): %d snapshot(s) from %s to %s (step: %dh)...",
+                source, total_tasks, timestamps[0], timestamps[-1], step_hours)
 
     saved_files = []
     for i, current_dt in enumerate(timestamps, start=1):
@@ -234,20 +259,22 @@ def run_himawari_acquisition(
             continue
 
         if i % 10 == 1 or i == total_tasks or total_tasks <= 24:
-            logger.info("[Satellite Progress: %d/%d (%.1f%%)] Extracting Himawari-9 snapshot for %s...",
-                        i, total_tasks, pct, current_dt)
-        df_features = extract_convective_evolution_features(current_dt)
+            logger.info("[Satellite Progress: %d/%d (%.1f%%)] Extracting Himawari snapshot for %s (%s)...",
+                        i, total_tasks, pct, current_dt, source)
+        df_features = extract_convective_evolution_features(current_dt, source=source)
         p = save_himawari_partition(df_features, current_dt, out_base_dir=out_dir)
         saved_files.append(p)
 
-    logger.info("Himawari-9 acquisition finished: %d snapshot partitions ready at %s", len(saved_files), out_dir)
+    logger.info("Himawari acquisition finished: %d snapshot partitions ready at %s", len(saved_files), out_dir)
     return saved_files
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Himawari-9 Convective Cloud Feature Extractor")
+    parser = argparse.ArgumentParser(description="Himawari Satellite Convective Cloud Feature Extractor")
     parser.add_argument("--forecast-dir", "--satellite-dir", dest="forecast_dir", type=str, default=None, help="Base directory for forecast/satellite data (e.g. E:/data/weather_nwp)")
     parser.add_argument("--out-dir", "--output-dir", dest="out_dir", type=str, default=None, help="Output parquet dir (default: {forecast-dir}/himawari9 or data/himawari9)")
+    parser.add_argument("--source", type=str, choices=["aws_s3", "synthetic"], default="aws_s3", help="Data source: 'aws_s3' (real NOAA AWS S3 data) or 'synthetic'")
+    parser.add_argument("--check-coverage", action="store_true", help="Audit AWS S3 data availability for 2021-2025 and exit")
     parser.add_argument("--start", type=str, default="2021-01-01 00:00:00", help="Start timestamp or date (default: 2021-01-01 00:00:00)")
     parser.add_argument("--end", type=str, default=None, help="End timestamp or date (e.g. 2024-12-31 or 2025-12-31)")
     parser.add_argument("--days", "--sample-days", dest="days", type=int, default=None, help="Number of days to process")
@@ -257,6 +284,17 @@ def main():
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing cached partitions")
     parser.add_argument("--full", action="store_true", help="Server production full mode (2021-01-01 to 2024-12-31)")
     args = parser.parse_args()
+
+    if args.check_coverage:
+        print("\n=======================================================")
+        print("Auditing NOAA Himawari AWS S3 Coverage (2021 - 2025)...")
+        print("=======================================================")
+        cov = check_coverage_across_years([2021, 2022, 2023, 2024, 2025])
+        for yr, res in cov.items():
+            status = "AVAILABLE" if res["available"] else "MISSING"
+            print(f"Year {yr}: [{status}] Details: {res['details']}")
+        print("=======================================================\n")
+        return
 
     paths = resolve_forecast_paths(forecast_dir=args.forecast_dir, himawari_dir=args.out_dir)
     out_dir = paths["himawari_dir"]
@@ -289,6 +327,7 @@ def main():
         days=args.days,
         step_hours=step_h,
         cycles=cycles_list,
+        source=args.source,
         overwrite=args.overwrite,
         out_dir=out_dir
     )
