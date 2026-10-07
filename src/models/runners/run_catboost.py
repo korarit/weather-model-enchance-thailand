@@ -94,9 +94,15 @@ def train_and_eval_catboost(
     logger.info("Saved CatBoost checkpoint: %s", ckpt_file)
 
     val_pred_bias = model.predict(X_val)
-    val_rmse = float(np.sqrt(np.mean((val_pred_bias - y_val.to_numpy()) ** 2)))
-    logger.info("CatBoost [%s] [%s] Validation RMSE: %.4f (on %d val samples)",
-                weather_model.upper(), ablation.upper(), val_rmse, len(y_val))
+    y_val_arr = y_val.to_numpy()
+    raw_rmse = float(np.sqrt(np.mean(y_val_arr ** 2)))
+    val_rmse = float(np.sqrt(np.mean((val_pred_bias - y_val_arr) ** 2)))
+    diff_pct = ((raw_rmse - val_rmse) / raw_rmse) * 100.0 if raw_rmse > 0 else 0.0
+
+    logger.info(
+        "CatBoost [%s] [%s] Val RMSE -> Before (Raw NWP): %.4f | After (Corrected): %.4f (Skill: %+.2f%%) [on %d val samples]",
+        weather_model.upper(), ablation.upper(), raw_rmse, val_rmse, diff_pct, len(y_val)
+    )
 
     # Free X_val, y_val before export
     del X_val, y_val

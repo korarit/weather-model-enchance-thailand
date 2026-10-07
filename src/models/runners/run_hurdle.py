@@ -124,8 +124,15 @@ def train_and_eval_hurdle(
     nwp_raw_val = df_val["nwp_rain_raw"].to_numpy(dtype=float)
     final_bias_pred = np.where(probs >= prob_threshold, bias_preds_cond, -nwp_raw_val)
 
-    val_rmse = float(np.sqrt(np.mean((final_bias_pred - y_bias_val.to_numpy()) ** 2)))
-    logger.info("Hurdle [%s] [%s] Combined Validation RMSE: %.4f", weather_model.upper(), ablation.upper(), val_rmse)
+    y_bias_arr = y_bias_val.to_numpy()
+    raw_rmse = float(np.sqrt(np.mean(y_bias_arr ** 2)))
+    val_rmse = float(np.sqrt(np.mean((final_bias_pred - y_bias_arr) ** 2)))
+    diff_pct = ((raw_rmse - val_rmse) / raw_rmse) * 100.0 if raw_rmse > 0 else 0.0
+
+    logger.info(
+        "Hurdle [%s] [%s] Val RMSE -> Before (Raw NWP): %.4f | After (Corrected): %.4f (Skill: %+.2f%%) [on %d val samples]",
+        weather_model.upper(), ablation.upper(), raw_rmse, val_rmse, diff_pct, len(y_bias_val)
+    )
 
     del X_val, y_bin_val, y_bias_val, probs, bias_preds_cond
     gc.collect()

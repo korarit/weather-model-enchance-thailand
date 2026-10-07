@@ -167,8 +167,15 @@ def train_and_eval_stgnn(
     with torch.no_grad():
         val_pred_bias = model(X_val_t, adj_val).numpy()
 
-    val_rmse = float(np.sqrt(np.mean((val_pred_bias - y_val_t.numpy()) ** 2)))
-    logger.info("ST-GNN [%s] [%s] Validation RMSE: %.4f", weather_model.upper(), ablation.upper(), val_rmse)
+    y_val_arr = y_val_t.numpy()
+    raw_rmse = float(np.sqrt(np.mean(y_val_arr ** 2)))
+    val_rmse = float(np.sqrt(np.mean((val_pred_bias - y_val_arr) ** 2)))
+    diff_pct = ((raw_rmse - val_rmse) / raw_rmse) * 100.0 if raw_rmse > 0 else 0.0
+
+    logger.info(
+        "ST-GNN [%s] [%s] Val RMSE -> Before (Raw NWP): %.4f | After (Corrected): %.4f (Skill: %+.2f%%) [on %d val samples]",
+        weather_model.upper(), ablation.upper(), raw_rmse, val_rmse, diff_pct, len(y_val_arr)
+    )
 
     del X_val_t, y_val_t, adj_val
     gc.collect()

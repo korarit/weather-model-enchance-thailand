@@ -110,8 +110,15 @@ def train_and_eval_quantile(
     logger.info("Saved all quantile checkpoints in %s", model_dir)
 
     pred_q50 = median_pred_bias if median_pred_bias is not None else quantile_preds["q50"]
-    val_rmse_q50 = float(np.sqrt(np.mean((pred_q50 - y_val.to_numpy()) ** 2)))
-    logger.info("Multi-Quantile [%s] [%s] q50 Validation RMSE: %.4f", weather_model.upper(), ablation.upper(), val_rmse_q50)
+    y_val_arr = y_val.to_numpy()
+    raw_rmse = float(np.sqrt(np.mean(y_val_arr ** 2)))
+    val_rmse_q50 = float(np.sqrt(np.mean((pred_q50 - y_val_arr) ** 2)))
+    diff_pct = ((raw_rmse - val_rmse_q50) / raw_rmse) * 100.0 if raw_rmse > 0 else 0.0
+
+    logger.info(
+        "Multi-Quantile [%s] [%s] q50 Val RMSE -> Before (Raw NWP): %.4f | After (Corrected): %.4f (Skill: %+.2f%%) [on %d val samples]",
+        weather_model.upper(), ablation.upper(), raw_rmse, val_rmse_q50, diff_pct, len(y_val)
+    )
 
     del X_val, y_val
     gc.collect()
