@@ -355,6 +355,107 @@ def generate_synthetic_nwp_payload(
     return out_file
 
 
+def build_tigge_monthly_request(
+    origin: str,
+    year: str,
+    month: str,
+    days: List[str],
+    cycles: List[str] = FORECAST_CYCLES,
+    steps: List[str] = LEAD_STEPS,
+    area: List[float] = THAILAND_BBOX,
+    forecast_type: str = "control_forecast",
+    variables: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Constructs an aggregated monthly API payload for CDS/ECDS dataset 'tigge-forecasts'.
+    Batches multiple days and cycles into a single supercomputer extraction job.
+    """
+    cds_origin = CDS_ORIGIN_MAP.get(origin.lower(), origin.lower())
+    time_list = [c if ":" in c else f"{int(c):02d}:00" for c in cycles]
+
+    var_list = variables or TIGGE_VARIABLES
+    var_clean = []
+    var_fix = {
+        "2m_temperature": "2_m_temperature",
+        "10m_u_component_of_wind": "10_m_u_component_of_wind",
+        "10m_v_component_of_wind": "10_m_v_component_of_wind",
+    }
+    for v in var_list:
+        var_clean.append(var_fix.get(v, v))
+
+    return {
+        "origin": cds_origin,
+        "year": str(year),
+        "month": f"{int(month):02d}",
+        "day": [f"{int(d):02d}" for d in sorted(list(set(days)))],
+        "time": time_list,
+        "level_type": "single_level",
+        "variable": var_clean,
+        "forecast_type": forecast_type,
+        "leadtime_hour": [str(int(s)) for s in steps],
+        "data_format": "grib",
+        "area": area,
+    }
+
+
+def unpack_monthly_grib(monthly_grib: Path, output_dir: Path, origin: str) -> List[Path]:
+    """
+    Splits a consolidated monthly GRIB2 file into standard daily cycle files:
+    tigge_{origin}_{YYYYMMDD}_{HHz}.grib
+    Pure Python stream splitting without external C/library dependencies.
+    """
+    target_dir = output_dir / origin
+    target_dir.mkdir(parents=True, exist_ok=True)
+    created_files = set()
+    open_handles = {}
+
+    try:
+        with open(monthly_grib, "rb") as f:
+            data = f.read()
+
+        offset = 0
+        total_len = len(data)
+        while offset < total_len - 16:
+            grib_idx = data.find(b"GRIB", offset)
+            if grib_idx == -1:
+                break
+
+            edition = data[grib_idx + 7]
+            if edition == 2:
+                msg_len = int.from_bytes(data[grib_idx + 8 : grib_idx + 16], "big")
+                if msg_len <= 0 or grib_idx + msg_len > total_len:
+                    offset = grib_idx + 4
+                    continue
+
+                # Parse section 1 reference date
+                year = int.from_bytes(data[grib_idx + 28 : grib_idx + 30], "big")
+                month = data[grib_idx + 30]
+                day = data[grib_idx + 31]
+                hour = data[grib_idx + 32]
+                run_tag = f"{year:04d}{month:02d}{day:02d}_{hour:02d}z"
+                cycle_file = target_dir / f"tigge_{origin}_{run_tag}.grib"
+
+                if cycle_file not in open_handles:
+                    open_handles[cycle_file] = open(cycle_file, "ab")
+                    created_files.add(cycle_file)
+
+                open_handles[cycle_file].write(data[grib_idx : grib_idx + msg_len])
+                offset = grib_idx + msg_len
+            else:
+                # GRIB1 format support
+                msg_len = int.from_bytes(data[grib_idx + 4 : grib_idx + 7], "big")
+                if msg_len <= 0 or grib_idx + msg_len > total_len:
+                    offset = grib_idx + 4
+                    continue
+                offset = grib_idx + msg_len
+    finally:
+        for fh in open_handles.values():
+            fh.close()
+
+    logger.info("Unpacked monthly GRIB into %d daily cycle files in %s", len(created_files), target_dir)
+    return sorted(list(created_files))
+
+
 def download_tigge_cycle(
     origin: str,
     date_str: str,
@@ -406,6 +507,88 @@ def download_tigge_cycle(
     return generate_synthetic_nwp_payload(origin, date_str, cycle, LEAD_STEPS, output_dir)
 
 
+def download_tigge_month(
+    origin: str,
+    year: str,
+    month: str,
+    days: List[str],
+    cycles: List[str] = FORECAST_CYCLES,
+    output_dir: Path = DEFAULT_RAW_DIR,
+    use_synthetic_fallback: bool = True,
+    forecast_type: str = "control_forecast",
+    dataset: str = "tigge-forecasts",
+    key: Optional[str] = None,
+    url: str = DEFAULT_CDS_URL,
+) -> List[Path]:
+    """
+    Downloads a full month of forecast cycles in 1 single CDS request,
+    then automatically unpacks it into daily cycle files.
+    """
+    target_dir = output_dir / origin
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if all daily cycle files are already present
+    expected_cycle_files = []
+    all_cached = True
+    for d_str in days:
+        date_full = f"{year}-{month}-{int(d_str):02d}"
+        for c in cycles:
+            c_tag = c.replace(":", "")[:2]
+            run_tag = f"{date_full.replace('-', '')}_{c_tag}z"
+            grib_f = target_dir / f"tigge_{origin}_{run_tag}.grib"
+            pq_f = target_dir / f"run_{run_tag}_synthetic.parquet"
+            if grib_f.exists():
+                expected_cycle_files.append(grib_f)
+            elif pq_f.exists():
+                expected_cycle_files.append(pq_f)
+            else:
+                all_cached = False
+
+    if all_cached and expected_cycle_files:
+        logger.info("Found cached cycles for %s %s-%s (%d files), skipping download.", origin, year, month, len(expected_cycle_files))
+        return expected_cycle_files
+
+    month_tag = f"{year}{int(month):02d}"
+    monthly_grib = target_dir / f"tigge_{origin}_{month_tag}_monthly.grib"
+
+    if check_cds_configured(key):
+        try:
+            client = CDSRestClient(url=url, key=key)
+            req = build_tigge_monthly_request(
+                origin=origin,
+                year=year,
+                month=month,
+                days=days,
+                cycles=cycles,
+                forecast_type=forecast_type,
+            )
+            logger.info("Submitting monthly batch request: %s %s-%s (%d days, %d cycles) to CDS/ECDS...",
+                        origin, year, month, len(days), len(cycles))
+            client.retrieve(dataset, req, monthly_grib)
+            logger.info("Downloaded monthly GRIB (%d bytes). Unpacking into daily cycles...", monthly_grib.stat().st_size)
+
+            unpacked = unpack_monthly_grib(monthly_grib, output_dir, origin)
+            # Remove intermediate raw monthly file to conserve disk space
+            if monthly_grib.exists() and unpacked:
+                monthly_grib.unlink()
+            return unpacked
+        except Exception as e:
+            logger.warning("Monthly CDS download failed for %s (%s-%s): %s. Fallback triggered.", origin, year, month, e)
+            if not use_synthetic_fallback:
+                raise e
+    else:
+        logger.info("No CDS credentials found. Generating synthetic NWP cycles for %s-%s.", year, month)
+
+    # Fallback: Generate daily synthetic payloads for the month
+    fallback_files = []
+    for d_str in days:
+        date_full = f"{year}-{month}-{int(d_str):02d}"
+        for c in cycles:
+            p = generate_synthetic_nwp_payload(origin, date_full, c, LEAD_STEPS, output_dir)
+            fallback_files.append(p)
+    return fallback_files
+
+
 def run_batch_acquisition(
     dates: List[str],
     origins: List[str],
@@ -415,38 +598,86 @@ def run_batch_acquisition(
     forecast_type: str = "control_forecast",
     key: Optional[str] = None,
     url: str = DEFAULT_CDS_URL,
+    batch_mode: str = "monthly",
 ) -> List[Path]:
-    """Runs batch NWP forecast cycle acquisition across dates and origins."""
+    """
+    Runs batch NWP forecast cycle acquisition across dates and origins.
+    By default (batch_mode='monthly'), groups requests by calendar month,
+    drastically reducing CDS queue wait time from thousands of jobs to ~1 job per month.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-    total_tasks = len(dates) * len(origins) * len(cycles)
-    logger.info("Starting NWP Acquisition: %d dates, %d origins, %d cycles (Total: %d tasks)",
-                len(dates), len(origins), len(cycles), total_tasks)
-    output_files = []
-    completed = 0
-    for d in dates:
-        for orig in origins:
-            for c in cycles:
+
+    if batch_mode == "monthly":
+        from collections import defaultdict
+        # Group dates by (year, month) -> list of day strings
+        months_map = defaultdict(list)
+        for d in dates:
+            dt = pd.Timestamp(d)
+            y_str = f"{dt.year:04d}"
+            m_str = f"{dt.month:02d}"
+            d_str = f"{dt.day:02d}"
+            months_map[(y_str, m_str)].append(d_str)
+
+        total_tasks = len(months_map) * len(origins)
+        logger.info("Starting NWP Acquisition (MONTHLY BATCH MODE): %d months, %d origins (Total: %d CDS Jobs)",
+                    len(months_map), len(origins), total_tasks)
+
+        output_files = []
+        completed = 0
+        for (y_str, m_str), d_list in sorted(months_map.items()):
+            for orig in origins:
                 completed += 1
                 pct = (completed / total_tasks) * 100
-                logger.info("[NWP Progress: %d/%d (%.1f%%)] Fetching %s | Date: %s | Cycle: %s...",
-                            completed, total_tasks, pct, orig, d, c)
-                p = download_tigge_cycle(
+                logger.info("[NWP Progress: %d/%d (%.1f%%)] Fetching %s | Month: %s-%s (%d days, %d cycles)...",
+                            completed, total_tasks, pct, orig, y_str, m_str, len(d_list), len(cycles))
+                files = download_tigge_month(
                     origin=orig,
-                    date_str=d,
-                    cycle=c,
+                    year=y_str,
+                    month=m_str,
+                    days=d_list,
+                    cycles=cycles,
                     output_dir=output_dir,
                     use_synthetic_fallback=use_synthetic_fallback,
                     forecast_type=forecast_type,
                     key=key,
                     url=url,
                 )
-                output_files.append(p)
-    logger.info("NWP Acquisition finished: %d/%d forecast files ready at %s", len(output_files), total_tasks, output_dir)
-    return output_files
+                output_files.extend(files)
+        logger.info("NWP Monthly Acquisition finished: %d cycle files ready across %d months at %s",
+                    len(output_files), len(months_map), output_dir)
+        return output_files
+
+    else:
+        # Legacy daily cycle-by-cycle mode
+        total_tasks = len(dates) * len(origins) * len(cycles)
+        logger.info("Starting NWP Acquisition (DAILY MODE): %d dates, %d origins, %d cycles (Total: %d tasks)",
+                    len(dates), len(origins), len(cycles), total_tasks)
+        output_files = []
+        completed = 0
+        for d in dates:
+            for orig in origins:
+                for c in cycles:
+                    completed += 1
+                    pct = (completed / total_tasks) * 100
+                    logger.info("[NWP Progress: %d/%d (%.1f%%)] Fetching %s | Date: %s | Cycle: %s...",
+                                completed, total_tasks, pct, orig, d, c)
+                    p = download_tigge_cycle(
+                        origin=orig,
+                        date_str=d,
+                        cycle=c,
+                        output_dir=output_dir,
+                        use_synthetic_fallback=use_synthetic_fallback,
+                        forecast_type=forecast_type,
+                        key=key,
+                        url=url,
+                    )
+                    output_files.append(p)
+        logger.info("NWP Acquisition finished: %d/%d forecast files ready at %s", len(output_files), total_tasks, output_dir)
+        return output_files
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TIGGE NWP Forecast Cycles Downloader (Direct REST API)")
+    parser = argparse.ArgumentParser(description="TIGGE NWP Forecast Cycles Downloader (Direct REST API & Monthly Batch)")
     parser.add_argument("--key", type=str, default=None, help="Copernicus CDS API Key / Personal Access Token")
     parser.add_argument("--url", type=str, default=DEFAULT_CDS_URL, help=f"Copernicus CDS API URL (default: {DEFAULT_CDS_URL})")
     parser.add_argument("--forecast-dir", "--nwp-dir", dest="forecast_dir", type=str, default=None, help="Base directory for NWP forecast data (e.g. E:/data/weather_nwp)")
@@ -456,6 +687,7 @@ def main():
     parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
     parser.add_argument("--origins", type=str, default="ecmf,kwbc", help="Comma-separated TIGGE origins (e.g. ecmf,kwbc,cwao or ecmwf,ncep)")
     parser.add_argument("--forecast-type", type=str, default="control_forecast", choices=["control_forecast", "perturbed_forecast"], help="CDS forecast type")
+    parser.add_argument("--batch-by", type=str, default="month", choices=["month", "day"], help="Batch requests by 'month' (fastest, reduces queue jobs ~60x) or 'day'")
     parser.add_argument("--no-fallback", action="store_true", help="Raise error if CDS download fails instead of generating synthetic data")
     parser.add_argument("--full", action="store_true", help="Run full multi-year download (Server production)")
     args = parser.parse_args()
@@ -485,6 +717,7 @@ def main():
         forecast_type=args.forecast_type,
         key=args.key,
         url=args.url,
+        batch_mode="monthly" if args.batch_by == "month" else "daily",
     )
 
 

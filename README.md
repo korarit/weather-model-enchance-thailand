@@ -231,14 +231,16 @@ python src/data/hii_audit.py --hii-dir "D:/data/hii" --mode sample
 ```bash
 # 4.1 ดาวน์โหลดและแปลง NWP Forecast Cycles (ECMWF IFS, NOAA NCEP GFS ฯลฯ)
 # ใช้ Direct REST API (ไม่ต้องติดตั้งหรือ import cdsapi, รองรับส่ง API Key ผ่าน CLI ได้โดยตรง)
+# ทำงานแบบ Monthly Batch Mode อัตโนมัติ (--batch-by month) ลดงานในคิว CDS ลง ~60 เท่า (จาก 17,532 เหลือเพียง ~48 Jobs ต่อศูนย์):
 # โหมด Dev Sample (มี Auto-synthetic fallback หากยังไม่มี key):
 python src/data/tigge_downloader.py --forecast-dir "E:/data/nwp" --sample-days 2
 
-# โหมด Production (ใส่ CDS Personal Access Token และระบุศูนย์พยากรณ์):
+# โหมด Production (ใส่ CDS Personal Access Token, ยิงทีละ 1 เดือนแล้วแตกเป็น Daily GRIB อัตโนมัติ):
 python src/data/tigge_downloader.py \
   --forecast-dir "E:/data/nwp" \
-  --origins ecmwf,ncep \
-  --start 2021-01-01 --end 2021-01-05 \
+  --origins ecmwf \
+  --start 2021-01-01 --end 2024-12-31 \
+  --batch-by month \
   --key "YOUR_COPERNICUS_CDS_API_KEY" \
   --forecast-type control_forecast \
   --no-fallback
