@@ -964,7 +964,7 @@ def generate_all_charts(output_dir: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 5 Benchmark Chart Generator")
-    parser.add_argument("--dir", type=str, default="outputs/benchmark_2025/", help="Output directory containing reports")
+    parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/benchmark_2025/", help="Output directory containing reports")
     args = parser.parse_args()
 
     out_p = Path(args.dir)

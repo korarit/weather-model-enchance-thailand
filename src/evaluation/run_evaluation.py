@@ -910,7 +910,7 @@ The Department of Water Resources (DWR) station network was strictly withheld fr
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 5 Hydrological Evaluation Runner")
-    parser.add_argument("--dir", type=str, default="outputs/benchmark_2025/", help="Output directory for benchmark artifacts")
+    parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/benchmark_2025/", help="Output directory for benchmark artifacts")
     parser.add_argument("--smoke-test", action="store_true", default=True, help="Run smoke test benchmark")
     args = parser.parse_args()
 

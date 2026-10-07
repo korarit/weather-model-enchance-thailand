@@ -121,12 +121,13 @@ def main():
     parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "meteo_arpege", "all"], default=None, help="Target Weather Model (or 'all')")
     parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default=None, help="Feature ablation variant")
     parser.add_argument("--smoke-test", action="store_true", help="Run rapid smoke test on PC")
-    parser.add_argument("--dir", type=str, default="outputs/hurdle/", help="Base output directory")
+    parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/hurdle/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")
     parser.add_argument("--data-file", type=str, help="Path to training features parquet")
     args = parser.parse_args()
 
-    output_dir = PROJECT_ROOT / args.dir
+    dir_p = Path(args.dir)
+    output_dir = dir_p if dir_p.is_absolute() else PROJECT_ROOT / dir_p
     weather_models, ablations, hyperparams = resolve_runner_execution_targets(
         config_path=args.config,
         weather_model_arg=args.weather_model,
