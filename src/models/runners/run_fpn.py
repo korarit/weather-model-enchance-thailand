@@ -28,6 +28,7 @@ from src.models.common import (
     resolve_runner_execution_targets,
     standardize_dataframe_columns,
     load_training_dataset,
+    get_train_val_split,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,22 +127,21 @@ def train_and_eval_fpn(
     logger.info("Training Spatial FPN on [%s] [%s] with %d features (smoke_test=%s)...",
                 weather_model.upper(), ablation.upper(), len(features), smoke_test)
 
-    X_mat = df[features].copy().fillna(0.0).to_numpy(dtype=np.float32)
-    y_vec = df["target_bias"].to_numpy(dtype=np.float32)
+    # Strict Out-Of-Time Partitioning: Train on 2021-2023, strictly lock 2024 as Validation
+    train_mask, val_mask = get_train_val_split(df, val_year=2024)
 
-    import gc
-    split_idx = int(len(df) * 0.7)
-    X_train_t = torch.from_numpy(df.iloc[:split_idx][features].fillna(0.0).to_numpy(dtype=np.float32))
-    y_train_t = torch.from_numpy(df.iloc[:split_idx]["target_bias"].to_numpy(dtype=np.float32))
-    X_val_t = torch.from_numpy(df.iloc[split_idx:][features].fillna(0.0).to_numpy(dtype=np.float32))
-    y_val_t = torch.from_numpy(df.iloc[split_idx:]["target_bias"].to_numpy(dtype=np.float32))
+    X_train_t = torch.from_numpy(df.loc[train_mask, features].fillna(0.0).to_numpy(dtype=np.float32))
+    y_train_t = torch.from_numpy(df.loc[train_mask, "target_bias"].to_numpy(dtype=np.float32))
+    X_val_t = torch.from_numpy(df.loc[val_mask, features].fillna(0.0).to_numpy(dtype=np.float32))
+    y_val_t = torch.from_numpy(df.loc[val_mask, "target_bias"].to_numpy(dtype=np.float32))
 
     meta_cols = [c for c in [
         "valid_time", "run_time", "lead_time_hours", "lead_time", "weather_model",
         "station_id", "grid_id", "lat", "lon", "target_lat", "target_lon",
         "basin_id", "basin_name", "observed_rain", "nwp_rain_raw", "target_bias"
     ] if c in df.columns]
-    df_val = df.iloc[split_idx:][meta_cols].copy()
+    df_val = df.loc[val_mask, meta_cols].copy()
+
 
     model = SpatialFPNModel(in_features=len(features), hidden_dim=16 if smoke_test else 32)
     criterion = nn.HuberLoss()

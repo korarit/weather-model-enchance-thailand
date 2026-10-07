@@ -29,6 +29,7 @@ from src.models.common import (
     standardize_dataframe_columns,
     resolve_lat_lon,
     load_training_dataset,
+    get_train_val_split,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,26 +101,41 @@ def train_and_eval_stgnn(
     lats = lat_s.to_numpy(dtype=float)
     lons = lon_s.to_numpy(dtype=float)
 
+    # Strict Out-Of-Time Partitioning: Train on 2021-2023, strictly lock 2024 as Validation
+    train_mask, val_mask = get_train_val_split(df, val_year=2024)
+
     max_graph_nodes = 100 if smoke_test else 2000
     adj = build_spatial_adjacency(lats, lons, max_nodes=max_graph_nodes)
     sub_n = len(adj)
 
-    # Subsample or slice to graph node limit for GNN computation
-    split_idx = int(sub_n * 0.7)
-    X_train_t = torch.from_numpy(df.iloc[:split_idx][features].fillna(0.0).to_numpy(dtype=np.float32))
-    y_train_t = torch.from_numpy(df.iloc[:split_idx]["target_bias"].to_numpy(dtype=np.float32))
-    adj_train = adj[:split_idx, :split_idx]
+    # Subsample masks to graph node limit for GNN adjacency dimension alignment
+    train_sub = train_mask[:sub_n]
+    val_sub = val_mask[:sub_n]
 
-    X_val_t = torch.from_numpy(df.iloc[split_idx:sub_n][features].fillna(0.0).to_numpy(dtype=np.float32))
-    y_val_t = torch.from_numpy(df.iloc[split_idx:sub_n]["target_bias"].to_numpy(dtype=np.float32))
-    adj_val = adj[split_idx:sub_n, split_idx:sub_n]
+    # Ensure at least 1 sample in train and val within sub_n limit
+    if np.sum(train_sub) == 0 or np.sum(val_sub) == 0:
+        split_idx = int(sub_n * 0.7)
+        train_sub = np.zeros(sub_n, dtype=bool)
+        val_sub = np.zeros(sub_n, dtype=bool)
+        train_sub[:split_idx] = True
+        val_sub[split_idx:] = True
+
+    df_sub = df.iloc[:sub_n]
+    X_train_t = torch.from_numpy(df_sub.loc[train_sub, features].fillna(0.0).to_numpy(dtype=np.float32))
+    y_train_t = torch.from_numpy(df_sub.loc[train_sub, "target_bias"].to_numpy(dtype=np.float32))
+    adj_train = adj[train_sub][:, train_sub]
+
+    X_val_t = torch.from_numpy(df_sub.loc[val_sub, features].fillna(0.0).to_numpy(dtype=np.float32))
+    y_val_t = torch.from_numpy(df_sub.loc[val_sub, "target_bias"].to_numpy(dtype=np.float32))
+    adj_val = adj[val_sub][:, val_sub]
 
     meta_cols = [c for c in [
         "valid_time", "run_time", "lead_time_hours", "lead_time", "weather_model",
         "station_id", "grid_id", "lat", "lon", "target_lat", "target_lon",
         "basin_id", "basin_name", "observed_rain", "nwp_rain_raw", "target_bias"
     ] if c in df.columns]
-    df_val = df.iloc[split_idx:sub_n][meta_cols].copy()
+    df_val = df_sub.loc[val_sub, meta_cols].copy()
+
 
     model = STGNNModel(in_dim=len(features), hidden_dim=16 if smoke_test else 32)
     criterion = nn.HuberLoss()

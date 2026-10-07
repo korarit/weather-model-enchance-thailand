@@ -121,7 +121,7 @@ def generate_configs():
                     "ablation_variant": v_code,
                     "variant_description": f"[{wm.upper()}] " + v_info["desc"],
                     "data": {
-                        "train_years": [2021, 2022, 2023, 2024],
+                        "train_years": [2021, 2022, 2023],
                         "val_years": [2024],
                         "frozen_test_year": 2025,
                         "target_column": "target_bias",

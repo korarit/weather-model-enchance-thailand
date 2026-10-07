@@ -26,6 +26,7 @@ from src.models.common import (
     resolve_runner_execution_targets,
     standardize_dataframe_columns,
     load_training_dataset,
+    get_train_val_split,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,16 +46,16 @@ def train_and_eval_catboost(
     features = ABLATION_FEATURES[ablation]
     logger.info("Training CatBoost on [%s] [%s] with %d features (smoke_test=%s)...", weather_model.upper(), ablation.upper(), len(features), smoke_test)
 
-    # ZERO-COPY slicing directly on df to avoid duplicating multi-gigabyte matrices
-    split_idx = int(len(df) * 0.7)
-    
-    # Train set (70%)
-    X_train = df.iloc[:split_idx][features].fillna(0.0)
-    y_train = df.iloc[:split_idx]["target_bias"]
+    # Strict Out-Of-Time Partitioning: Train on 2021-2023, strictly lock 2024 as Validation
+    train_mask, val_mask = get_train_val_split(df, val_year=2024)
 
-    # Validation set (30%)
-    X_val = df.iloc[split_idx:][features].fillna(0.0)
-    y_val = df.iloc[split_idx:]["target_bias"]
+    # Train set (Years 2021-2023 or chronologically first 70%)
+    X_train = df.loc[train_mask, features].fillna(0.0)
+    y_train = df.loc[train_mask, "target_bias"]
+
+    # Validation set (Strictly Year 2024 or chronologically last 30%)
+    X_val = df.loc[val_mask, features].fillna(0.0)
+    y_val = df.loc[val_mask, "target_bias"]
 
     # Extract only required metadata columns for prediction export (reduces val slice RAM by 80%)
     meta_cols = [c for c in [
@@ -62,7 +63,8 @@ def train_and_eval_catboost(
         "station_id", "grid_id", "lat", "lon", "target_lat", "target_lon",
         "basin_id", "basin_name", "observed_rain", "nwp_rain_raw", "target_bias"
     ] if c in df.columns]
-    df_val = df.iloc[split_idx:][meta_cols].copy()
+    df_val = df.loc[val_mask, meta_cols].copy()
+
 
     iterations = 3 if smoke_test else 100
     params = {

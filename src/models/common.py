@@ -81,9 +81,87 @@ def assert_valid_training_years(df: pd.DataFrame, time_col: str = "valid_time"):
             )
 
 
+def get_train_val_split(
+    df: pd.DataFrame,
+    val_year: int = 2024,
+    time_col: Optional[str] = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Partitions dataset into Train and Validation sets adhering to strict Out-Of-Time (OOT) protocol:
+    - If year `val_year` (default 2024) is present:
+        Train = rows where year < val_year (e.g. 2021, 2022, 2023)
+        Validation = rows where year == val_year (strictly locked to 2024, zero leakage)
+    - If `val_year` is not present (e.g. single-cycle test, smoke test on 2021 only):
+        Chronological split: sorts chronologically by timestamp, using first 70% as train, last 30% as val.
+    - Year 2025 is strictly verified to NOT exist (reserved for Phase 5 out-of-time evaluation).
+
+    Returns:
+        (train_mask, val_mask): Boolean numpy arrays of shape (len(df),)
+    """
+    col = time_col if time_col in df.columns else (
+        "valid_time" if "valid_time" in df.columns else (
+            "run_time" if "run_time" in df.columns else ("timestamp" if "timestamp" in df.columns else None)
+        )
+    )
+
+    if col and col in df.columns:
+        timestamps = pd.to_datetime(df[col])
+        years = timestamps.dt.year.to_numpy()
+
+        if 2025 in years:
+            raise ValueError(
+                f"[FROZEN TEST LEAKAGE] Data from 2025 detected in column '{col}'! "
+                "2025 must remain strictly frozen for Phase 5 out-of-time evaluation."
+            )
+
+        if val_year in years:
+            train_mask = (years < val_year)
+            val_mask = (years == val_year)
+
+            # Fallback if only val_year exists in dataset
+            if np.sum(train_mask) == 0:
+                logger.warning("Only year %d found in dataset. Falling back to chronological 70/30 split.", val_year)
+                sort_indices = np.argsort(timestamps.to_numpy())
+                split_idx = int(len(df) * 0.7)
+                train_mask = np.zeros(len(df), dtype=bool)
+                val_mask = np.zeros(len(df), dtype=bool)
+                train_mask[sort_indices[:split_idx]] = True
+                val_mask[sort_indices[split_idx:]] = True
+            else:
+                train_years_present = sorted(list(set(years[train_mask])))
+                logger.info(
+                    "[Strict OOT Split] Train: %d rows (years: %s) | Validation: %d rows (strictly locked to year %d)",
+                    int(np.sum(train_mask)), train_years_present, int(np.sum(val_mask)), val_year
+                )
+            return train_mask, val_mask
+        else:
+            # val_year not in dataset (e.g. smoke test on 2021)
+            avail_years = sorted(list(set(years)))
+            logger.info(
+                "[Chronological Split] Year %d not found (dataset years: %s). Applying chronological 70/30 split by %s.",
+                val_year, avail_years, col
+            )
+            sort_indices = np.argsort(timestamps.to_numpy())
+            split_idx = int(len(df) * 0.7)
+            train_mask = np.zeros(len(df), dtype=bool)
+            val_mask = np.zeros(len(df), dtype=bool)
+            train_mask[sort_indices[:split_idx]] = True
+            val_mask[sort_indices[split_idx:]] = True
+            return train_mask, val_mask
+
+    # Fallback if no datetime column exists
+    split_idx = int(len(df) * 0.7)
+    train_mask = np.zeros(len(df), dtype=bool)
+    val_mask = np.zeros(len(df), dtype=bool)
+    train_mask[:split_idx] = True
+    val_mask[split_idx:] = True
+    return train_mask, val_mask
+
+
 SUPPORTED_WEATHER_MODELS = [
     "ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "meteo_arpege"
 ]
+
 
 
 def generate_smoke_test_dataset(
