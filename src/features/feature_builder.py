@@ -166,17 +166,23 @@ def assemble_unified_training_matrix(
     return merged
 
 
-def run_sample_builder(
+def build_feature_matrices(
     output_dir: Path = DEFAULT_FEATURES_DIR,
     geo_dir: Path = DEFAULT_GEO_DIR,
     hii_meta_dir: Path = DEFAULT_HII_META_DIR,
     raw_nwp_dir: Path = DEFAULT_RAW_NWP_DIR,
     out_nwp_dir: Path = DEFAULT_OUT_NWP_DIR,
     himawari_dir: Path = DEFAULT_HIMAWARI_DIR,
-) -> Path:
-    """Executes end-to-end sample feature assembly for dev validation."""
+    process_all: bool = False,
+    combine: bool = True,
+) -> List[Path]:
+    """
+    Executes feature assembly across NWP forecast cycles.
+    If process_all=False, processes 1 sample cycle (default dev mode).
+    If process_all=True, processes all available NWP forecast cycles and optionally merges them.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("=== Starting Multi-Modal Feature Assembly Pipeline ===")
+    logger.info("=== Starting Multi-Modal Feature Assembly Pipeline (process_all=%s) ===", process_all)
 
     logger.info("[Feature Step 1/4] Loading Thailand 2 km Master Grid from %s...", geo_dir)
     grid_df = load_master_grid(geo_dir=geo_dir)
@@ -187,25 +193,26 @@ def run_sample_builder(
     indexer = SpatialObservationIndexer(stn_meta_df)
 
     logger.info("[Feature Step 3/4] Ingesting NWP Forecast cycles and Himawari-9 satellite features...")
-    # Load or generate sample NWP & Himawari inputs
-    from src.data.tigge_extractor import run_extraction_pipeline
-    nwp_files = run_extraction_pipeline(raw_dir=raw_nwp_dir, out_dir=out_nwp_dir)
-    if nwp_files:
-        nwp_df = pd.read_parquet(nwp_files[0])
-    else:
+    # Find existing processed NWP forecasts or run extraction
+    nwp_files = sorted(list(out_nwp_dir.glob("**/*.parquet")))
+    if not nwp_files:
+        from src.data.tigge_extractor import run_extraction_pipeline
+        nwp_files = run_extraction_pipeline(raw_dir=raw_nwp_dir, out_dir=out_nwp_dir)
+
+    if not nwp_files:
         from src.data.tigge_downloader import download_tigge_cycle
         raw_p = download_tigge_cycle("ecmf", "2021-01-01", "00:00", output_dir=raw_nwp_dir)
         from src.data.tigge_extractor import process_raw_nwp_file
         nwp_pq = process_raw_nwp_file(raw_p, output_base_dir=out_nwp_dir)
-        nwp_df = pd.read_parquet(nwp_pq)
+        nwp_files = [nwp_pq] if nwp_pq else []
 
-    run_time = nwp_df["run_time"].iloc[0]
+    target_files = nwp_files if process_all else (nwp_files[:1] if nwp_files else [])
+    if not target_files:
+        raise RuntimeError("No NWP forecast runs available to build features.")
 
-    # Generate satellite features strictly at or before run_time
     from src.data.himawari_extractor import extract_convective_evolution_features
-    sat_df = extract_convective_evolution_features(run_time)
 
-    # Create station observations at t <= run_time
+    # Create baseline station observations
     sample_obs = {}
     for code in stn_meta_df["station_code"].dropna().head(100):
         sample_obs[code] = {
@@ -214,19 +221,64 @@ def run_sample_builder(
             "humidity": float(np.random.normal(78.0, 8.0)),
         }
 
-    logger.info("[Feature Step 4/4] Fusing Topography, Ground Observations and Satellite into 49-feature matrix...")
-    unified_matrix = assemble_unified_training_matrix(
-        nwp_forecast_df=nwp_df,
-        himawari_features_df=sat_df,
-        station_obs_dict=sample_obs,
-        grid_df=grid_df,
-        indexer=indexer
-    )
+    logger.info("[Feature Step 4/4] Fusing Topography, Ground Observations and Satellite for %d cycle(s)...", len(target_files))
+    saved_files = []
+    matrix_list = []
 
-    out_file = output_dir / f"training_features_{run_time.strftime('%Y%m%d_%Hz')}.parquet"
-    unified_matrix.to_parquet(out_file, index=False, compression="snappy")
-    logger.info("Saved unified training feature matrix to: %s", out_file)
-    return out_file
+    total_targets = len(target_files)
+    for idx, f in enumerate(target_files, start=1):
+        pct = (idx / total_targets) * 100
+        nwp_df = pd.read_parquet(f)
+        run_time = nwp_df["run_time"].iloc[0]
+        logger.info("  -> [%d/%d (%.1f%%)] Building feature matrix for cycle %s (%s)...",
+                    idx, total_targets, pct, run_time, f.name)
+
+        sat_df = extract_convective_evolution_features(run_time)
+        unified_matrix = assemble_unified_training_matrix(
+            nwp_forecast_df=nwp_df,
+            himawari_features_df=sat_df,
+            station_obs_dict=sample_obs,
+            grid_df=grid_df,
+            indexer=indexer
+        )
+        out_file = output_dir / f"training_features_{run_time.strftime('%Y%m%d_%Hz')}.parquet"
+        unified_matrix.to_parquet(out_file, index=False, compression="snappy")
+        saved_files.append(out_file)
+        if combine:
+            matrix_list.append(unified_matrix)
+
+    if combine and len(matrix_list) > 1:
+        combined_matrix = pd.concat(matrix_list, ignore_index=True)
+        combined_file = output_dir / "training_features_combined.parquet"
+        combined_matrix.to_parquet(combined_file, index=False, compression="snappy")
+        logger.info("Combined feature matrix created across %d cycles: %s (%d rows)",
+                    len(matrix_list), combined_file.name, len(combined_matrix))
+        saved_files.append(combined_file)
+
+    logger.info("Saved %d training feature matrix file(s) in: %s", len(saved_files), output_dir)
+    return saved_files
+
+
+def run_sample_builder(
+    output_dir: Path = DEFAULT_FEATURES_DIR,
+    geo_dir: Path = DEFAULT_GEO_DIR,
+    hii_meta_dir: Path = DEFAULT_HII_META_DIR,
+    raw_nwp_dir: Path = DEFAULT_RAW_NWP_DIR,
+    out_nwp_dir: Path = DEFAULT_OUT_NWP_DIR,
+    himawari_dir: Path = DEFAULT_HIMAWARI_DIR,
+) -> Path:
+    """Executes single sample cycle feature assembly (backward compatible)."""
+    files = build_feature_matrices(
+        output_dir=output_dir,
+        geo_dir=geo_dir,
+        hii_meta_dir=hii_meta_dir,
+        raw_nwp_dir=raw_nwp_dir,
+        out_nwp_dir=out_nwp_dir,
+        himawari_dir=himawari_dir,
+        process_all=False,
+        combine=False
+    )
+    return files[0]
 
 
 def main():
@@ -244,7 +296,9 @@ def main():
 
     # Common & Output arguments
     parser.add_argument("--geo-dir", type=str, default=str(DEFAULT_GEO_DIR), help="Master grid geo directory")
-    parser.add_argument("--output-dir", type=str, default=str(DEFAULT_FEATURES_DIR), help="Output features directory")
+    parser.add_argument("--output-dir", "--out-dir", dest="output_dir", type=str, default=str(DEFAULT_FEATURES_DIR), help="Output features directory")
+    parser.add_argument("--all", action="store_true", help="Process all available NWP forecast cycles in out-nwp-dir")
+    parser.add_argument("--no-combine", dest="combine", action="store_false", default=True, help="Disable combining all cycles into training_features_combined.parquet")
     args = parser.parse_args()
 
     hii_paths = resolve_hii_paths(hii_dir=args.hii_dir, meta_dir=args.hii_meta_dir, clean_dir=args.hii_clean_dir)
@@ -255,13 +309,15 @@ def main():
         himawari_dir=args.himawari_dir
     )
 
-    run_sample_builder(
+    build_feature_matrices(
         output_dir=Path(args.output_dir),
         geo_dir=Path(args.geo_dir),
         hii_meta_dir=hii_paths["meta_dir"],
         raw_nwp_dir=forecast_paths["raw_nwp_dir"],
         out_nwp_dir=forecast_paths["out_nwp_dir"],
         himawari_dir=forecast_paths["himawari_dir"],
+        process_all=args.all,
+        combine=args.combine,
     )
 
 
