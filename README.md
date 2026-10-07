@@ -245,6 +245,18 @@ python src/evaluation/generate_benchmark_charts.py --dir outputs/benchmark_2025/
 
 ---
 
+#### ⚡ สั่งรันคำสั่งเดียวแบบครบวงจร (One-Stop Pipeline Orchestrator)
+คุณสามารถสั่งรันทั้ง 6 ขั้นตอนข้างต้นรวดเดียวผ่าน `run_pipeline.py` โดยมี Log รายงาน Step และ % Progress แบบเรียลไทม์:
+```bash
+python run_pipeline.py \
+  --hii-dir "D:/data/hii" \
+  --forecast-dir "E:/data/nwp" \
+  --model catboost \
+  --smoke-test
+```
+
+---
+
 #### 💡 ทางเลือกเสริม: ตั้งค่าผ่าน Environment Variables (`.env`)
 หากไม่ต้องการระบุ `--hii-dir` ในทุกคำสั่ง สามารถคัดลอกไฟล์ `.env.example` เป็น `.env` แล้วระบุค่าไว้ล่วงหน้า ระบบจะอ่านค่าพาธเหล่านี้เป็นค่าเริ่มต้นให้อัตโนมัติ:
 ```env

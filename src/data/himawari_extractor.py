@@ -176,12 +176,16 @@ def run_himawari_acquisition(
     
     saved_files = []
     current_dt = start_dt
-    for _ in range(sample_hours):
+    for i in range(1, sample_hours + 1):
+        pct = (i / sample_hours) * 100
+        logger.info("[Satellite Progress: %d/%d (%.1f%%)] Extracting Himawari-9 snapshot for %s...",
+                    i, sample_hours, pct, current_dt)
         df_features = extract_convective_evolution_features(current_dt)
         p = save_himawari_partition(df_features, current_dt, out_base_dir=out_dir)
         saved_files.append(p)
         current_dt += pd.Timedelta(hours=1)
 
+    logger.info("Himawari-9 acquisition finished: %d/%d hourly partitions saved at %s", len(saved_files), sample_hours, out_dir)
     return saved_files
 
 

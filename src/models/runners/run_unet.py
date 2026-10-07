@@ -100,12 +100,13 @@ def train_and_eval_unet(
 
     epochs = 2 if smoke_test else 20
     model.train()
-    for _ in range(epochs):
+    for ep in range(1, epochs + 1):
         optimizer.zero_grad()
         out = model(X_train_t)
         loss = criterion(out, y_train_t)
         loss.backward()
         optimizer.step()
+        logger.info("  -> [U-Net Epoch %d/%d] Training Huber Loss: %.4f", ep, epochs, loss.item())
 
     # Save checkpoint
     model_dir = output_dir / "models" / "unet" / weather_model / ablation
@@ -118,6 +119,9 @@ def train_and_eval_unet(
     model.eval()
     with torch.no_grad():
         val_pred_bias = model(X_val_t).numpy()
+
+    val_rmse = float(np.sqrt(np.mean((val_pred_bias - y_val_t.numpy()) ** 2)))
+    logger.info("U-Net [%s] [%s] Validation RMSE: %.4f", weather_model.upper(), ablation.upper(), val_rmse)
 
     export_predictions(
         df=df_val,
@@ -146,8 +150,11 @@ def main():
         ablation_arg=args.ablation,
     )
 
-    logger.info("U-Net Runner Targets -> Weather Models: %s | Ablations: %s", weather_models, ablations)
+    total_runs = len(weather_models) * len(ablations)
+    logger.info("U-Net Runner Targets -> Weather Models: %s | Ablations: %s (Total: %d runs)",
+                weather_models, ablations, total_runs)
 
+    run_counter = 0
     for wm in weather_models:
         if args.data_file:
             assert_no_dwr_leakage(args.data_file)
@@ -157,6 +164,10 @@ def main():
             df = generate_smoke_test_dataset(n_samples=100, weather_model=wm)
 
         for ab in ablations:
+            run_counter += 1
+            pct = (run_counter / total_runs) * 100
+            logger.info("=== [Training Run %d/%d (%.1f%%)] Model: Spatial U-Net | Weather Model: %s | Ablation: %s ===",
+                        run_counter, total_runs, pct, wm.upper(), ab.upper())
             train_and_eval_unet(df, ab, output_dir=output_dir, weather_model=wm, smoke_test=args.smoke_test)
 
 

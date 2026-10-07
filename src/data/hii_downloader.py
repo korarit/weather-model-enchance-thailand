@@ -147,21 +147,36 @@ def download_clean_data(
             for yr in years:
                 total_tasks.append((cat, stn, yr))
 
-    logger.info("Total conversion tasks: %d", len(total_tasks))
+    total_count = len(total_tasks)
+    logger.info("Total conversion tasks: %d", total_count)
     saved_files = []
+    completed_count = 0
 
-    def task_worker(args):
-        c, s, y = args
-        return process_station_year(c, s, y, output_dir)
-
+    from concurrent.futures import as_completed
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        results = list(ex.map(task_worker, total_tasks))
+        future_to_task = {
+            ex.submit(process_station_year, c, s, y, output_dir): (c, s, y)
+            for c, s, y in total_tasks
+        }
+        for future in as_completed(future_to_task):
+            completed_count += 1
+            c, s, y = future_to_task[future]
+            pct = (completed_count / total_count) * 100
+            try:
+                res = future.result()
+                if res is not None:
+                    saved_files.append(res)
+                    logger.info("[Progress: %d/%d (%.1f%%)] Done %s | Station: %s | Year: %d -> %s",
+                                completed_count, total_count, pct, c, s, y, res.name)
+                else:
+                    logger.warning("[Progress: %d/%d (%.1f%%)] No data for %s | Station: %s | Year: %d",
+                                   completed_count, total_count, pct, c, s, y)
+            except Exception as e:
+                logger.error("[Progress: %d/%d (%.1f%%)] Failed %s | Station: %s | Year: %d: %s",
+                             completed_count, total_count, pct, c, s, y, e)
 
-    for p in results:
-        if p is not None:
-            saved_files.append(p)
-
-    logger.info("Acquisition complete! Successfully written %d Parquet partitions to %s", len(saved_files), output_dir)
+    logger.info("Acquisition complete! Successfully written %d/%d Parquet partitions to %s",
+                len(saved_files), total_count, output_dir)
     return saved_files
 
 

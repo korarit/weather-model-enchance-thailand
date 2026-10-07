@@ -87,9 +87,13 @@ def train_and_eval_quantile(
 
     logger.info("Saved all quantile checkpoints in %s", model_dir)
 
+    pred_q50 = median_pred_bias if median_pred_bias is not None else quantile_preds["q50"]
+    val_rmse_q50 = float(np.sqrt(np.mean((pred_q50 - y_val.to_numpy()) ** 2)))
+    logger.info("Multi-Quantile [%s] [%s] q50 Validation RMSE: %.4f", weather_model.upper(), ablation.upper(), val_rmse_q50)
+
     export_predictions(
         df=df_val,
-        predicted_bias=median_pred_bias if median_pred_bias is not None else quantile_preds["q50"],
+        predicted_bias=pred_q50,
         model_name="quantile",
         ablation=ablation,
         output_dir=output_dir,
@@ -115,8 +119,11 @@ def main():
         ablation_arg=args.ablation,
     )
 
-    logger.info("Quantile Runner Targets -> Weather Models: %s | Ablations: %s", weather_models, ablations)
+    total_runs = len(weather_models) * len(ablations)
+    logger.info("Quantile Runner Targets -> Weather Models: %s | Ablations: %s (Total: %d runs)",
+                weather_models, ablations, total_runs)
 
+    run_counter = 0
     for wm in weather_models:
         if args.data_file:
             assert_no_dwr_leakage(args.data_file)
@@ -126,6 +133,10 @@ def main():
             df = generate_smoke_test_dataset(n_samples=100, weather_model=wm)
 
         for ab in ablations:
+            run_counter += 1
+            pct = (run_counter / total_runs) * 100
+            logger.info("=== [Training Run %d/%d (%.1f%%)] Model: Multi-Quantile | Weather Model: %s | Ablation: %s ===",
+                        run_counter, total_runs, pct, wm.upper(), ab.upper())
             train_and_eval_quantile(df, ab, output_dir=output_dir, weather_model=wm, smoke_test=args.smoke_test, hyperparams=hyperparams)
 
 

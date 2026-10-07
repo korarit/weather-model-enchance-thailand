@@ -173,12 +173,17 @@ def run_sample_builder(
 ) -> Path:
     """Executes end-to-end sample feature assembly for dev validation."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Running Phase 3 Sample Feature Builder...")
+    logger.info("=== Starting Multi-Modal Feature Assembly Pipeline ===")
 
+    logger.info("[Feature Step 1/4] Loading Thailand 2 km Master Grid from %s...", geo_dir)
     grid_df = load_master_grid(geo_dir=geo_dir)
+    logger.info("Master Grid loaded: %d terrestrial grid cells.", len(grid_df))
+
+    logger.info("[Feature Step 2/4] Loading HII Station Metadata and Spatial KDTree Indexer from %s...", hii_meta_dir)
     stn_meta_df = load_stations_metadata(meta_dir=hii_meta_dir)
     indexer = SpatialObservationIndexer(stn_meta_df)
 
+    logger.info("[Feature Step 3/4] Ingesting NWP Forecast cycles and Himawari-9 satellite features...")
     # Load or generate sample NWP & Himawari inputs
     from src.data.tigge_extractor import run_extraction_pipeline
     nwp_files = run_extraction_pipeline(raw_dir=raw_nwp_dir, out_dir=out_nwp_dir)
@@ -206,6 +211,7 @@ def run_sample_builder(
             "humidity": float(np.random.normal(78.0, 8.0)),
         }
 
+    logger.info("[Feature Step 4/4] Fusing Topography, Ground Observations and Satellite into 49-feature matrix...")
     unified_matrix = assemble_unified_training_matrix(
         nwp_forecast_df=nwp_df,
         himawari_features_df=sat_df,

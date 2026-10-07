@@ -127,12 +127,16 @@ def process_raw_nwp_file(input_file: Path, output_base_dir: Path = DEFAULT_OUT_N
 def run_extraction_pipeline(raw_dir: Path = DEFAULT_RAW_NWP_DIR, out_dir: Path = DEFAULT_OUT_NWP_DIR) -> List[Path]:
     """Scans raw NWP directory and transforms all available runs into Analysis-Ready Parquet."""
     files = list(raw_dir.glob("**/*.parquet")) + list(raw_dir.glob("**/*.grib*"))
-    logger.info("Found %d raw NWP runs in %s", len(files), raw_dir)
+    total_files = len(files)
+    logger.info("Found %d raw NWP runs in %s", total_files, raw_dir)
     results = []
-    for f in files:
+    for idx, f in enumerate(files, start=1):
+        pct = (idx / total_files) * 100 if total_files > 0 else 100.0
+        logger.info("[Extract Progress: %d/%d (%.1f%%)] Processing NWP file: %s", idx, total_files, pct, f.name)
         res = process_raw_nwp_file(f, output_base_dir=out_dir)
         if res:
             results.append(res)
+    logger.info("Extraction pipeline finished: %d/%d Analysis-Ready Parquet files ready at %s", len(results), total_files, out_dir)
     return results
 
 

@@ -375,11 +375,13 @@ def run_audit(
     }
 
     # Stage 1: Presence Matrix Scan
+    logger.info("=== [Audit Stage 1/3] Scanning Presence Matrix across %d catalogs ===", len(catalogs))
     stage1_stats = {}
     catalog_matrices = {}
     catalog_stn_months = {}
 
-    for cat in catalogs:
+    for idx, cat in enumerate(catalogs, start=1):
+        logger.info("[Matrix Scan %d/%d] Scanning catalog: '%s'...", idx, len(catalogs), cat)
         df_mat, stn_m = scan_presence_matrix(cat, months, max_workers=max_workers)
         catalog_matrices[cat] = df_mat
         catalog_stn_months[cat] = stn_m
@@ -395,9 +397,7 @@ def run_audit(
     logger.info("Saved presence matrix to %s", mat_csv_path)
 
     # Stage 2: Deep Row-Level Stream Inspection
-    # Identify stations to inspect
     if mode == "sample":
-        # Pick limit_stations stations that have all months in rain catalog
         rain_mat = catalog_matrices.get("hourly_rain", all_mat_df)
         full_stns = rain_mat[rain_mat["months_present_count"] == len(months)]["station_code"].tolist()
         if not full_stns:
@@ -405,15 +405,22 @@ def run_audit(
         target_stns = full_stns[:limit_stations]
         logger.info("Sample mode: Inspecting %d stations: %s", len(target_stns), target_stns)
     else:
-        # Full mode: Inspect all stations with full presence (or all detected stations)
         rain_mat = catalog_matrices.get("hourly_rain", all_mat_df)
         target_stns = rain_mat[rain_mat["months_present_count"] == len(months)]["station_code"].tolist()
         logger.info("Full mode: Inspecting %d candidate stations with complete month continuity", len(target_stns))
 
+    total_deep_tasks = len(catalogs) * len(target_stns)
+    logger.info("=== [Audit Stage 2/3] Deep Inspecting %d stations across %d catalogs (Total %d inspections) ===",
+                len(target_stns), len(catalogs), total_deep_tasks)
+
     stage2_results = []
+    deep_counter = 0
     for cat in catalogs:
-        logger.info("Deep inspecting %d stations for '%s'...", len(target_stns), cat)
         for s in target_stns:
+            deep_counter += 1
+            pct = (deep_counter / total_deep_tasks) * 100 if total_deep_tasks > 0 else 100.0
+            logger.info("[Inspection %d/%d (%.1f%%)] Inspecting station: %s | Catalog: %s",
+                        deep_counter, total_deep_tasks, pct, s, cat)
             _, metrics = inspect_station_deep(cat, s, months, max_workers=4)
             stage2_results.append(metrics)
 
@@ -423,6 +430,8 @@ def run_audit(
     if not metadata_df.empty:
         meta_sub = metadata_df[["station_code", "station_name", "basin_name", "province_name", "amphoe_name", "latitude", "longitude"]].drop_duplicates("station_code")
         stage2_df = stage2_df.merge(meta_sub, on="station_code", how="left")
+
+    logger.info("=== [Audit Stage 3/3] Generating Audit Reports, Golden Stations & Spatial Maps ===")
 
     # Generate Golden stations CSV
     golden_df = stage2_df[stage2_df["is_golden"]].copy() if not stage2_df.empty else pd.DataFrame()

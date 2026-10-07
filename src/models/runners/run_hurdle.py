@@ -102,6 +102,9 @@ def train_and_eval_hurdle(
     nwp_raw_val = df_val["nwp_rain_raw"].to_numpy(dtype=float)
     final_bias_pred = np.where(probs >= prob_threshold, bias_preds_cond, -nwp_raw_val)
 
+    val_rmse = float(np.sqrt(np.mean((final_bias_pred - y_val.to_numpy()) ** 2)))
+    logger.info("Hurdle [%s] [%s] Combined Validation RMSE: %.4f", weather_model.upper(), ablation.upper(), val_rmse)
+
     export_predictions(
         df=df_val,
         predicted_bias=final_bias_pred,
@@ -129,8 +132,11 @@ def main():
         ablation_arg=args.ablation,
     )
 
-    logger.info("Hurdle Runner Targets -> Weather Models: %s | Ablations: %s", weather_models, ablations)
+    total_runs = len(weather_models) * len(ablations)
+    logger.info("Hurdle Runner Targets -> Weather Models: %s | Ablations: %s (Total: %d runs)",
+                weather_models, ablations, total_runs)
 
+    run_counter = 0
     for wm in weather_models:
         if args.data_file:
             assert_no_dwr_leakage(args.data_file)
@@ -140,6 +146,10 @@ def main():
             df = generate_smoke_test_dataset(n_samples=100, weather_model=wm)
 
         for ab in ablations:
+            run_counter += 1
+            pct = (run_counter / total_runs) * 100
+            logger.info("=== [Training Run %d/%d (%.1f%%)] Model: Hurdle GBDT | Weather Model: %s | Ablation: %s ===",
+                        run_counter, total_runs, pct, wm.upper(), ab.upper())
             train_and_eval_hurdle(df, ab, output_dir=output_dir, weather_model=wm, smoke_test=args.smoke_test, hyperparams=hyperparams)
 
 

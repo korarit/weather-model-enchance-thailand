@@ -208,13 +208,21 @@ def run_batch_acquisition(
 ) -> List[Path]:
     """Runs batch NWP forecast cycle acquisition across dates and origins."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Starting NWP Acquisition: %d dates, %d origins, %d cycles", len(dates), len(origins), len(cycles))
+    total_tasks = len(dates) * len(origins) * len(cycles)
+    logger.info("Starting NWP Acquisition: %d dates, %d origins, %d cycles (Total: %d tasks)",
+                len(dates), len(origins), len(cycles), total_tasks)
     output_files = []
+    completed = 0
     for d in dates:
         for orig in origins:
             for c in cycles:
+                completed += 1
+                pct = (completed / total_tasks) * 100
+                logger.info("[NWP Progress: %d/%d (%.1f%%)] Fetching %s | Date: %s | Cycle: %s...",
+                            completed, total_tasks, pct, orig, d, c)
                 p = download_tigge_cycle(orig, d, c, output_dir=output_dir, use_synthetic_fallback=True)
                 output_files.append(p)
+    logger.info("NWP Acquisition finished: %d/%d forecast files ready at %s", len(output_files), total_tasks, output_dir)
     return output_files
 
 
