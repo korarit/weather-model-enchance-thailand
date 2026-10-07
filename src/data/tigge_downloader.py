@@ -90,6 +90,19 @@ def check_cds_configured(key: Optional[str] = None) -> bool:
     return False
 
 
+# Meteorological centers with partial variable archiving in TIGGE on MARS:
+# ECCC (cwao), BoM (ammc), CMA, JMA, KMA, UKMO do not archive certain parameters.
+# Requesting non-existent variables causes ECMWF MARS tape retrieval to abort with status 'failed'.
+ORIGIN_EXCLUDED_VARIABLES = {
+    "eccc": {"convective_available_potential_energy"},
+    "bom": {"convective_available_potential_energy", "total_column_water"},
+    "cma": {"total_column_water"},
+    "jma": {"convective_available_potential_energy"},
+    "kma": {"convective_available_potential_energy", "total_column_water"},
+    "ukmo": {"convective_available_potential_energy", "total_column_water"},
+}
+
+
 def resolve_forecast_type_for_origin(origin: str, requested_type: str) -> str:
     """
     DWD ICON submits its single deterministic forecast as 'high_resolution_forecast'
@@ -101,6 +114,31 @@ def resolve_forecast_type_for_origin(origin: str, requested_type: str) -> str:
         logger.info("Automatically mapping forecast_type to 'high_resolution_forecast' for DWD (%s)", origin)
         return "high_resolution_forecast"
     return requested_type
+
+
+def resolve_variables_for_origin(origin: str, variables: Optional[List[str]] = None) -> List[str]:
+    """
+    Filters variables based on the meteorological center's TIGGE archiving capabilities.
+    E.g., ECCC and BoM do not archive CAPE or TCW in TIGGE; requesting them triggers MARS tape rejection.
+    """
+    cds_origin = CDS_ORIGIN_MAP.get(origin.lower(), origin.lower())
+    var_list = variables or TIGGE_VARIABLES
+    excluded = ORIGIN_EXCLUDED_VARIABLES.get(cds_origin, set())
+
+    var_fix = {
+        "2m_temperature": "2_m_temperature",
+        "10m_u_component_of_wind": "10_m_u_component_of_wind",
+        "10m_v_component_of_wind": "10_m_v_component_of_wind",
+    }
+    var_clean = []
+    for v in var_list:
+        canonical_v = var_fix.get(v, v)
+        if canonical_v in excluded or v in excluded:
+            logger.info("Skipping '%s' for origin '%s' (not archived by meteorological center)", canonical_v, cds_origin)
+            continue
+        var_clean.append(canonical_v)
+
+    return var_clean
 
 
 def build_tigge_request(
@@ -119,16 +157,7 @@ def build_tigge_request(
     dt = pd.Timestamp(date_str)
     time_str = cycle if ":" in cycle else f"{int(cycle):02d}:00"
     resolved_fc_type = resolve_forecast_type_for_origin(origin, forecast_type)
-
-    var_list = variables or TIGGE_VARIABLES
-    var_clean = []
-    var_fix = {
-        "2m_temperature": "2_m_temperature",
-        "10m_u_component_of_wind": "10_m_u_component_of_wind",
-        "10m_v_component_of_wind": "10_m_v_component_of_wind",
-    }
-    for v in var_list:
-        var_clean.append(var_fix.get(v, v))
+    var_clean = resolve_variables_for_origin(origin, variables)
 
     return {
         "origin": cds_origin,
@@ -394,16 +423,7 @@ def build_tigge_monthly_request(
     cds_origin = CDS_ORIGIN_MAP.get(origin.lower(), origin.lower())
     time_list = [c if ":" in c else f"{int(c):02d}:00" for c in cycles]
     resolved_fc_type = resolve_forecast_type_for_origin(origin, forecast_type)
-
-    var_list = variables or TIGGE_VARIABLES
-    var_clean = []
-    var_fix = {
-        "2m_temperature": "2_m_temperature",
-        "10m_u_component_of_wind": "10_m_u_component_of_wind",
-        "10m_v_component_of_wind": "10_m_v_component_of_wind",
-    }
-    for v in var_list:
-        var_clean.append(var_fix.get(v, v))
+    var_clean = resolve_variables_for_origin(origin, variables)
 
     return {
         "origin": cds_origin,

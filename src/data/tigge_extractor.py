@@ -83,6 +83,9 @@ def normalize_nwp_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         "_" + (clean_df["lon"] * 50).round().astype(int).astype(str)
     )
 
+    if "cape" not in clean_df.columns:
+        clean_df["cape"] = 0.0
+
     columns_order = [
         "origin", "run_time", "valid_time", "lead_time_hours",
         "grid_id", "lat", "lon", "tp", "sp", "t2m", "u10", "v10", "cape"
