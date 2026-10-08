@@ -106,9 +106,14 @@ def run_full_pipeline(
     else:
         if downloader == "hybrid":
             from src.data.hybrid_downloader import run_hybrid_batch
-            target_models = ["ecmwf_ifs", "gfs"] if weather_model == "all" else [
-                "ecmwf_ifs" if weather_model in ("ecmwf_ifs", "ecmf", "ecmwf") else "gfs"
-            ]
+            if weather_model == "all":
+                target_models = ["ecmwf_ifs", "gfs", "jma_gsm"]
+            elif weather_model in ("jma_gsm", "jma", "rjtd"):
+                target_models = ["jma_gsm"]
+            elif weather_model in ("ecmwf_ifs", "ecmf", "ecmwf"):
+                target_models = ["ecmwf_ifs"]
+            else:
+                target_models = ["gfs"]
             run_hybrid_batch(
                 models=target_models,
                 start_date="2021-01-01",
@@ -236,7 +241,7 @@ def main():
     parser.add_argument("--forecast-dir", "--nwp-dir", dest="forecast_dir", type=str, default=None, help="Base directory for NWP forecast data (e.g. E:/data/weather_nwp)")
     parser.add_argument("--output-dir", type=str, default="outputs/pipeline_run", help="Output directory")
     parser.add_argument("--model", choices=["catboost", "lightgbm", "hurdle", "quantile", "stgnn", "unet", "linknet", "fpn"], default="catboost", help="ML Architecture")
-    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "all"], default="ecmwf_ifs", help="Target Weather Model")
+    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "jma_gsm", "dwd_icon", "cmc_gem", "bom_access", "all"], default="ecmwf_ifs", help="Target Weather Model")
     parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default="m1", help="Feature ablation variant")
     parser.add_argument("--downloader", choices=["tigge", "hybrid"], default="tigge", help="NWP downloader backend ('tigge' or 'hybrid')")
     parser.add_argument("--smoke-test", action="store_true", default=True, help="Fast smoke test mode")

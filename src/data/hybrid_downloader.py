@@ -6,6 +6,8 @@ Combines real operational archives from:
      - Covers 2021-2025+ complete archive
   2. ECMWF IFS: From Open-Meteo Historical Forecast API
      - Seamless hourly series transformed with a Rolling-Window lead time mapping (1 to 24h)
+  3. JMA GSM: From Open-Meteo Historical Forecast API
+     - Japan Meteorological Agency Global Spectral Model transformed with Rolling-Window lead time mapping (1 to 24h)
 
 Produces identical Analysis-Ready Parquet files matching the system schema:
   ['origin', 'run_time', 'valid_time', 'lead_time_hours', 'grid_id', 'lat', 'lon',
@@ -50,7 +52,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 OPEN_METEO_HISTORICAL_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 NOAA_GFS_S3_BUCKET = "noaa-gfs-bdp-pds"
 
-# Strictly support ONLY these 2 models
+# Supported models
 SUPPORTED_HYBRID_MODELS = {
     "ecmwf_ifs": {
         "primary_source": "openmeteo",
@@ -64,6 +66,12 @@ SUPPORTED_HYBRID_MODELS = {
         "origin_name": "gfs",
         "description": "NOAA NCEP GFS (Direct from AWS S3 noaa-gfs-bdp-pds)",
     },
+    "jma_gsm": {
+        "primary_source": "openmeteo",
+        "open_meteo_model": "jma_gsm",
+        "origin_name": "jma_gsm",
+        "description": "JMA GSM (Japan Meteorological Agency Global Spectral Model via Open-Meteo)",
+    },
 }
 
 MODEL_ALIASES = {
@@ -75,6 +83,9 @@ MODEL_ALIASES = {
     "gfs_global": "gfs",
     "ncep": "gfs",
     "kwbc": "gfs",
+    "jma_gsm": "jma_gsm",
+    "jma": "jma_gsm",
+    "rjtd": "jma_gsm",
 }
 
 DEFAULT_CYCLES = ["00:00", "12:00"]
@@ -92,13 +103,13 @@ DEFAULT_SAMPLE_LOCATIONS = [
 
 
 def resolve_model_key(model: str) -> str:
-    """Validates and resolves requested model name to canonical key ('ecmwf_ifs' or 'gfs')."""
+    """Validates and resolves requested model name to canonical key ('ecmwf_ifs', 'gfs', or 'jma_gsm')."""
     m_clean = model.strip().lower()
     if m_clean in MODEL_ALIASES:
         return MODEL_ALIASES[m_clean]
     raise ValueError(
         f"Model '{model}' is not supported by hybrid downloader. "
-        f"Hybrid downloader strictly supports only 2 models: 'ecmwf_ifs' and 'gfs' "
+        f"Hybrid downloader supports: 'ecmwf_ifs', 'gfs', and 'jma_gsm' "
         f"(Accepted aliases: {list(MODEL_ALIASES.keys())})"
     )
 
@@ -643,13 +654,13 @@ def run_hybrid_batch(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Hybrid NWP Downloader (GFS from AWS S3 & ECMWF IFS from Open-Meteo)"
+        description="Hybrid NWP Downloader (GFS from AWS S3, ECMWF IFS & JMA GSM from Open-Meteo)"
     )
     parser.add_argument(
         "--models",
         nargs="+",
         default=["ecmwf_ifs", "gfs"],
-        help="NWP Models (Strictly supports only: 'ecmwf_ifs' and 'gfs')",
+        help="NWP Models (Supports: 'ecmwf_ifs', 'gfs', 'jma_gsm')",
     )
     parser.add_argument("--start-date", type=str, default="2021-01-01", help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, default="2021-01-02", help="End date (YYYY-MM-DD)")

@@ -15,7 +15,7 @@
 ระบบ **Thailand 2 km Multi-Modal Precipitation Bias Correction** เป็นแพลตฟอร์มปรับแก้และเพิ่มความละเอียดการพยากรณ์ฝนเชิงพื้นที่ (Spatial Downscaling & Statistical Bias Correction) สำหรับประเทศไทย โดยยกระดับผลพยากรณ์จากแบบจำลองสภาพอากาศโลก **ECMWF IFS (ความละเอียด ~11 km / 0.1°)** ลงสู่ **ตารางกริดความละเอียดสูง 2 km × 2 km ทั่วประเทศ (ครอบคลุม 69,121 เซลล์กริด)**
 
 ระบบนี้หลอมรวมข้อมูลหลากหลายมิติ (Multi-Modal Data Fusion):
-1. **แบบจำลองพยากรณ์อากาศโลก (NWP Forecasts)**: ข้อมูล ECMWF IFS และ NOAA NCEP GFS ผ่านระบบ **Hybrid Engine** (GFS ตรงจาก AWS S3 และ ECMWF IFS ผ่าน Open-Meteo พร้อม Rolling Window Lead Time) หรือคลังข้อมูล **TIGGE**
+1. **แบบจำลองพยากรณ์อากาศโลก (NWP Forecasts)**: ข้อมูล ECMWF IFS, NOAA NCEP GFS, และ JMA GSM ผ่านระบบ **Hybrid Engine** (GFS ตรงจาก AWS S3, ECMWF IFS และ JMA GSM ผ่าน Open-Meteo พร้อม Rolling Window Lead Time) หรือคลังข้อมูล **TIGGE**
 2. **ข้อมูลโทรมาตรสถานีวัดน้ำฝนภาคพื้นดิน (Ground Rain Gauges)**: จากสถาบันสารสนเทศทรัพยากรน้ำ (องค์การมหาชน) - HII
 3. **ภาพถ่ายดาวเทียมอุตุนิยมวิทยาแบบวงโคจรค้างฟ้า (Geostationary Satellite)**: Himawari-9 Band 08 (Water Vapor) และ Band 13 (Clean IR)
 4. **แบบจำลองระดับความสูงและภูมิประเทศเชิงพื้นที่ (Topography & Geomorphology)**: **Copernicus DEM 30m (GLO-30)** จาก AWS Open Data (รองรับทั้งข้อมูลจริงและ Synthetic Baseline ผ่าน `--dem-source {copernicus, synthetic}`), ความลาดชัน (Slope), ทิศทางลาดชัน (Aspect), ระยะห่างจากแนวชายฝั่ง (Distance to Coast), และพารามิเตอร์คอริออลิส (Coriolis Parameter)
@@ -390,9 +390,10 @@ python src/features/feature_builder.py --downloader tigge
 ```
 
 #### 4.4 การดาวน์โหลดข้อมูล NWP ด้วย Hybrid Downloader (`src/data/hybrid_downloader.py`)
-ระบบมี **Hybrid Downloader** ที่หลอมรวม 2 แหล่งข้อมูลระดับโลก สำหรับเทรนและทดสอบย้อนหลังปี 2021–2025:
+ระบบมี **Hybrid Downloader** ที่หลอมรวมแหล่งข้อมูลระดับโลก สำหรับเทรนและทดสอบย้อนหลังปี 2021–2025:
 * **NOAA NCEP GFS (Direct from AWS S3: `noaa-gfs-bdp-pds`)**: ดึงตรงจาก AWS S3 ด้วย unsigned byte-range GRIB2 queries (โหลดเฉพาะตัวแปร ~1-2 MB ต่อรอบ ไม่ต้องโหลดไฟล์เต็ม 500 MB) ได้รอบรันจริง (00z, 06z, 12z, 18z) และ Lead time จริง ($f001-f024$)
 * **ECMWF IFS (Open-Meteo Historical Forecast API)**: ดึงข้อมูลผ่าน Open-Meteo และแปลงเป็นรอบรันพยากรณ์ด้วย **Rolling-Window Lead Time Mapping** (lead 1 ถึง 24h)
+* **JMA GSM (Open-Meteo Historical Forecast API)**: ดึงข้อมูลแบบจำลอง Global Spectral Model ของกรมอุตุนิยมวิทยาญี่ปุ่น (JMA) ผ่าน Open-Meteo พร้อม **Rolling-Window Lead Time Mapping** (lead 1 ถึง 24h)
 
 ```bash
 # ดาวน์โหลด GFS ตรงจาก AWS S3 (ย้อนหลัง 2021-ปัจจุบัน ครบ 100%)
@@ -401,8 +402,11 @@ python src/data/hybrid_downloader.py --models gfs --start-date 2021-06-01 --end-
 # ดาวน์โหลด ECMWF IFS ผ่าน Open-Meteo (พร้อม Rolling Window Lead Time 1..24h)
 python src/data/hybrid_downloader.py --models ecmwf_ifs --start-date 2021-06-01 --end-date 2021-06-02
 
-# ดาวน์โหลดพร้อมกันทั้ง 2 โมเดล (GFS จาก AWS S3 + ECMWF จาก Open-Meteo)
-python src/data/hybrid_downloader.py --models ecmwf_ifs gfs --start-date 2021-06-01 --end-date 2021-06-02
+# ดาวน์โหลด JMA GSM ผ่าน Open-Meteo (พร้อม Rolling Window Lead Time 1..24h)
+python src/data/hybrid_downloader.py --models jma_gsm --start-date 2021-06-01 --end-date 2021-06-02
+
+# ดาวน์โหลดพร้อมกันทั้ง 3 โมเดล (GFS จาก AWS S3 + ECMWF และ JMA จาก Open-Meteo)
+python src/data/hybrid_downloader.py --models ecmwf_ifs gfs jma_gsm --start-date 2021-06-01 --end-date 2021-06-02
 ```
 
 ---
