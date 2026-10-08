@@ -407,6 +407,9 @@ python src/data/hybrid_downloader.py --models jma_gsm --start-date 2021-06-01 --
 
 # ดาวน์โหลดพร้อมกันทั้ง 3 โมเดล (GFS จาก AWS S3 + ECMWF และ JMA จาก Open-Meteo)
 python src/data/hybrid_downloader.py --models ecmwf_ifs gfs jma_gsm --start-date 2021-06-01 --end-date 2021-06-02
+
+# โหมด Production เต็มรูปแบบ: ดาวน์โหลดทุกสถานีครอบคลุมหลายปี (2021-01-01 ถึง 2025-12-31)
+python src/data/hybrid_downloader.py --models ecmwf_ifs gfs jma_gsm --full
 ```
 
 ---

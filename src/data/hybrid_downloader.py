@@ -550,13 +550,14 @@ def download_hybrid_cycle(
     locations: Optional[List[Tuple[float, float]]] = None,
     output_dir: Optional[Path] = None,
     meta_dir: Optional[Path] = None,
+    stations_limit: Optional[int] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
     gfs_source: str = "aws",
 ) -> Path:
     """
     Downloads and maps a single forecast cycle for the specified model:
     - GFS: Pulls from AWS S3 by default (or falls back to Open-Meteo)
-    - ECMWF IFS: Pulls from Open-Meteo + Rolling Window lead time
+    - ECMWF IFS / JMA GSM: Pulls from Open-Meteo + Rolling Window lead time
     """
     model_key = resolve_model_key(model)
     out_dir = Path(output_dir) if output_dir else DEFAULT_OUT_NWP_DIR
@@ -569,7 +570,7 @@ def download_hybrid_cycle(
         logger.info("[Cached] Hybrid cycle already exists: %s", out_file)
         return out_file
 
-    coords = load_locations(meta_dir=meta_dir, custom_coords=locations)
+    coords = load_locations(meta_dir=meta_dir, limit=stations_limit, custom_coords=locations)
     df_result = None
 
     if model_key == "gfs" and gfs_source.lower() == "aws":
@@ -584,7 +585,7 @@ def download_hybrid_cycle(
             logger.warning("AWS S3 GFS retrieval encountered an issue: %s. Falling back to Open-Meteo...", e)
 
     if df_result is None or df_result.empty:
-        # ECMWF IFS or GFS fallback
+        # ECMWF IFS, JMA GSM, or GFS fallback
         logger.info("Fetching [%s] via Open-Meteo Historical Forecast API...", model_key.upper())
         df_result = download_open_meteo_cycle(
             model_key=model_key,
@@ -607,17 +608,18 @@ def run_hybrid_batch(
     cycles: Optional[List[str]] = None,
     output_dir: Optional[Path] = None,
     meta_dir: Optional[Path] = None,
+    stations_limit: Optional[int] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
     gfs_source: str = "aws",
 ) -> List[Path]:
     """
     Executes batch download across a date range:
     - GFS: directly from AWS S3 (noaa-gfs-bdp-pds)
-    - ECMWF IFS: from Open-Meteo Historical Forecast API
+    - ECMWF IFS / JMA GSM: from Open-Meteo Historical Forecast API
     """
     cycles = cycles or DEFAULT_CYCLES
     out_dir = Path(output_dir) if output_dir else DEFAULT_OUT_NWP_DIR
-    coords = load_locations(meta_dir=meta_dir, custom_coords=locations)
+    coords = load_locations(meta_dir=meta_dir, limit=stations_limit, custom_coords=locations)
 
     start_dt = pd.to_datetime(start_date)
     end_dt = pd.to_datetime(end_date)
@@ -640,6 +642,7 @@ def run_hybrid_batch(
                         locations=coords,
                         output_dir=out_dir,
                         meta_dir=meta_dir,
+                        stations_limit=stations_limit,
                         max_lead_hours=max_lead_hours,
                         gfs_source=gfs_source,
                     )
@@ -662,8 +665,42 @@ def main():
         default=["ecmwf_ifs", "gfs"],
         help="NWP Models (Supports: 'ecmwf_ifs', 'gfs', 'jma_gsm')",
     )
-    parser.add_argument("--start-date", type=str, default="2021-01-01", help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end-date", type=str, default="2021-01-02", help="End date (YYYY-MM-DD)")
+    parser.add_argument(
+        "--start-date", "--start",
+        dest="start_date",
+        type=str,
+        default="2021-01-01",
+        help="Start date (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--end-date", "--end",
+        dest="end_date",
+        type=str,
+        default=None,
+        help="End date (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--sample-days",
+        type=int,
+        default=2,
+        help="Number of sample days for dev mode (default: 2)",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Run full multi-year production download (2021-01-01 to 2025-12-31 across all stations)",
+    )
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="Dev sample mode (limited stations and sample days)",
+    )
+    parser.add_argument(
+        "--stations-limit",
+        type=int,
+        default=None,
+        help="Limit number of stations to download (default: None for full mode)",
+    )
     parser.add_argument("--cycles", nargs="+", default=DEFAULT_CYCLES, help="Forecast cycles (e.g. 00:00 12:00)")
     parser.add_argument("--max-lead", type=int, default=DEFAULT_MAX_LEAD, help="Max lead time hours (default: 24)")
     parser.add_argument("--out-dir", type=str, default=str(DEFAULT_OUT_NWP_DIR), help="Output directory for processed parquet cycles")
@@ -677,14 +714,41 @@ def main():
     validated_models = [resolve_model_key(m) for m in args.models]
     custom_coords = [(args.lat, args.lon)] if args.lat is not None and args.lon is not None else None
 
+    # Date resolution protocol matching tigge_downloader & pipeline:
+    start_dt = pd.Timestamp(args.start_date)
+    if args.end_date:
+        end_dt = pd.Timestamp(args.end_date)
+    elif args.full:
+        end_dt = pd.Timestamp("2025-12-31")
+    else:
+        end_dt = start_dt + pd.Timedelta(days=args.sample_days - 1)
+
+    start_date_str = start_dt.strftime("%Y-%m-%d")
+    end_date_str = end_dt.strftime("%Y-%m-%d")
+
+    # Stations limit protocol:
+    if args.stations_limit is not None:
+        stn_limit = args.stations_limit
+    elif args.full:
+        stn_limit = None  # Full production mode -> all stations
+    elif custom_coords:
+        stn_limit = None
+    else:
+        stn_limit = 5  # Dev mode default to avoid unintended heavy loads
+
+    logger.info("Hybrid execution mode: %s (Dates: %s to %s, Stations limit: %s)",
+                "FULL PRODUCTION" if args.full else "DEV SAMPLE",
+                start_date_str, end_date_str, stn_limit if stn_limit else "ALL")
+
     run_hybrid_batch(
         models=validated_models,
-        start_date=args.start_date,
-        end_date=args.end_date,
+        start_date=start_date_str,
+        end_date=end_date_str,
         locations=custom_coords,
         cycles=args.cycles,
         output_dir=Path(args.out_dir),
         meta_dir=Path(args.meta_dir),
+        stations_limit=stn_limit,
         max_lead_hours=args.max_lead,
         gfs_source=args.gfs_source,
     )
