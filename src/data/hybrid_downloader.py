@@ -17,6 +17,7 @@ Produces identical Analysis-Ready Parquet files matching the system schema:
 import os
 import sys
 import time
+import json
 import math
 import argparse
 import logging
@@ -260,19 +261,27 @@ def download_gfs_cycle_from_aws(
     date_str: str,
     cycle_str: str,
     coords: List[Tuple[float, float]],
+    raw_dir: Optional[Path] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
     max_workers: int = 6,
 ) -> pd.DataFrame:
     """
     Downloads full forecast horizon of a GFS cycle from NOAA AWS S3
     and formats into analysis-ready records with genuine lead_time_hours.
+    Persists raw per-lead checkpoints as JSON to allow resuming if stopped midway.
     """
     s3 = get_s3_client()
     chour = int(cycle_str.split(":")[0])
     run_time = pd.Timestamp(f"{date_str} {cycle_str}")
+    date_clean = date_str.replace("-", "")
+    cycle_clean = f"{chour:02d}z"
 
-    logger.info("Ingesting GFS directly from AWS S3 (noaa-gfs-bdp-pds) for %s %sz across %d location(s)...",
-                date_str, f"{chour:02d}", len(coords))
+    raw_base = Path(raw_dir) if raw_dir else DEFAULT_RAW_NWP_DIR
+    raw_gfs_dir = raw_base / "gfs" / f"run_{date_clean}_{cycle_clean}"
+    raw_gfs_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Ingesting GFS directly from AWS S3 (noaa-gfs-bdp-pds) for %s %s across %d location(s)...",
+                date_str, cycle_clean, len(coords))
 
     # Resolve S3 keys for available lead steps
     lead_keys = {}
@@ -284,20 +293,60 @@ def download_gfs_cycle_from_aws(
     if not lead_keys:
         raise RuntimeError(f"No GFS S3 keys found for {date_str} {cycle_str} in bucket {NOAA_GFS_S3_BUCKET}")
 
-    logger.info("Found %d lead step(s) on AWS S3 for GFS run %s %sz", len(lead_keys), date_str, f"{chour:02d}")
+    logger.info("Found %d lead step(s) on AWS S3 for GFS run %s %s", len(lead_keys), date_str, cycle_clean)
 
-    # Fetch lead steps in parallel
-    lead_data = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(fetch_gfs_s3_single_lead, key, coords, s3): lead
-            for lead, key in lead_keys.items()
-        }
-        for fut in as_completed(future_map):
-            lead = future_map[fut]
-            res = fut.result()
-            if res:
-                lead_data[lead] = res
+    # Check for existing raw checkpoints on disk
+    lead_data: Dict[int, Dict[str, List[float]]] = {}
+    missing_leads: Dict[int, str] = {}
+
+    for lead, key in lead_keys.items():
+        lead_cache_file = raw_gfs_dir / f"lead_f{lead:03d}.json"
+        if lead_cache_file.exists() and lead_cache_file.stat().st_size > 0:
+            try:
+                with open(lead_cache_file, "r", encoding="utf-8") as f:
+                    cached_lead = json.load(f)
+                cached_vars = cached_lead.get("variables", {})
+                if all(v in cached_vars and len(cached_vars[v]) == len(coords)
+                       for v in ["t2m", "sp", "u10", "v10", "apcp", "cape"]):
+                    lead_data[lead] = cached_vars
+                    continue
+            except Exception as e:
+                logger.warning("Corrupted GFS raw lead checkpoint %s (%s). Re-fetching...", lead_cache_file.name, e)
+
+        missing_leads[lead] = key
+
+    if lead_data:
+        logger.info("[Cached Raw] Loaded %d/%d GFS lead step(s) from %s", len(lead_data), len(lead_keys), raw_gfs_dir)
+
+    if missing_leads:
+        logger.info("Fetching remaining %d/%d GFS lead step(s) from AWS S3...", len(missing_leads), len(lead_keys))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(fetch_gfs_s3_single_lead, key, coords, s3): (lead, key)
+                for lead, key in missing_leads.items()
+            }
+            for fut in as_completed(future_map):
+                lead, key = future_map[fut]
+                res = fut.result()
+                if res:
+                    lead_data[lead] = res
+                    # Save raw lead checkpoint atomically
+                    lead_cache_file = raw_gfs_dir / f"lead_f{lead:03d}.json"
+                    tmp_file = lead_cache_file.with_suffix(".tmp")
+                    lead_payload = {
+                        "date": date_str,
+                        "cycle": cycle_str,
+                        "lead": lead,
+                        "s3_key": key,
+                        "coords_count": len(coords),
+                        "variables": res,
+                    }
+                    try:
+                        with open(tmp_file, "w", encoding="utf-8") as f:
+                            json.dump(lead_payload, f)
+                        tmp_file.replace(lead_cache_file)
+                    except Exception as e:
+                        logger.warning("Could not write GFS lead checkpoint %s: %s", lead_cache_file.name, e)
 
     # Sort leads
     sorted_leads = sorted(lead_data.keys())
@@ -358,13 +407,31 @@ def fetch_open_meteo_single(
     model_key: str,
     start_date: str,
     end_date: str,
+    raw_dir: Optional[Path] = None,
     max_retries: int = 3,
     retry_delay: float = 2.0,
 ) -> Dict[str, Any]:
     """
     Fetches historical forecast time series from Open-Meteo for a single location (1 API call = 1 coordinate).
-    Never batches multiple coordinates into a single request.
+    Persists raw responses as JSON files to allow resuming if stopped midway.
     """
+    raw_base = Path(raw_dir) if raw_dir else DEFAULT_RAW_NWP_DIR
+    raw_om_dir = raw_base / "openmeteo" / model_key
+    raw_om_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_file = raw_om_dir / f"{model_key}_lat{lat:+.4f}_lon{lon:+.4f}_{start_date}_{end_date}.json"
+
+    # Checkpoint check: if raw JSON exists and is non-empty, load from disk
+    if raw_file.exists() and raw_file.stat().st_size > 0:
+        try:
+            with open(raw_file, "r", encoding="utf-8") as f:
+                cached_data = json.load(f)
+            if isinstance(cached_data, dict) and "hourly" in cached_data and cached_data["hourly"].get("time"):
+                logger.info("[Cached Raw] Loaded Open-Meteo JSON for (%.4f, %.4f) from %s", lat, lon, raw_file.name)
+                return cached_data
+        except Exception as e:
+            logger.warning("Corrupted raw Open-Meteo cache %s (%s). Re-fetching...", raw_file.name, e)
+
     model_cfg = SUPPORTED_HYBRID_MODELS[model_key]
     om_model = model_cfg["open_meteo_model"]
 
@@ -399,7 +466,14 @@ def fetch_open_meteo_single(
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
-                    return data[0] if data else {}
+                    data = data[0] if data else {}
+
+                # Save raw JSON checkpoint atomically
+                tmp_file = raw_file.with_suffix(".tmp")
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                tmp_file.replace(raw_file)
+                logger.debug("Saved Open-Meteo raw JSON checkpoint: %s", raw_file.name)
                 return data
             elif resp.status_code in (429, 500, 502, 503, 504):
                 logger.warning("Open-Meteo HTTP %d for (%.4f, %.4f) on attempt %d/%d. Waiting %.1fs...",
@@ -499,12 +573,14 @@ def download_open_meteo_cycle(
     date_str: str,
     cycle_str: str,
     coords: List[Tuple[float, float]],
+    raw_dir: Optional[Path] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
     delay_between_calls: float = 0.1,
 ) -> pd.DataFrame:
     """
     Downloads and maps a single forecast cycle from Open-Meteo.
     Strictly performs 1 API call per single coordinate pair (1 call 1 พิกัด).
+    Persists raw responses as JSON to raw_dir to allow resuming if stopped midway.
     """
     start_dt = pd.to_datetime(date_str)
     end_dt = start_dt + pd.Timedelta(days=math.ceil((max_lead_hours + 12) / 24.0))
@@ -526,6 +602,7 @@ def download_open_meteo_cycle(
                 model_key=model_key,
                 start_date=start_str,
                 end_date=end_str,
+                raw_dir=raw_dir,
             )
             cycle_df = map_rolling_window_to_cycles(
                 hourly_data=loc_resp,
@@ -559,6 +636,7 @@ def download_open_meteo_date_range(
     cycles: List[str],
     coords: List[Tuple[float, float]],
     output_dir: Path,
+    raw_dir: Optional[Path] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
     delay_between_calls: float = 0.1,
 ) -> List[Path]:
@@ -566,6 +644,7 @@ def download_open_meteo_date_range(
     Downloads and maps Open-Meteo forecasts across a date range.
     Queries Open-Meteo strictly 1 API call per single coordinate pair (1 call 1 พิกัด)
     for the requested date window, then maps to all requested forecast cycles.
+    Persists raw responses as JSON to raw_dir to allow resuming if stopped midway.
     """
     model_out_dir = output_dir / model_key
     model_out_dir.mkdir(parents=True, exist_ok=True)
@@ -607,6 +686,7 @@ def download_open_meteo_date_range(
                 model_key=model_key,
                 start_date=start_str,
                 end_date=api_end_str,
+                raw_dir=raw_dir,
             )
             df_loc = map_rolling_window_to_cycles(
                 hourly_data=loc_resp,
@@ -657,6 +737,7 @@ def download_hybrid_cycle(
     cycle_str: str = "00:00",
     locations: Optional[List[Tuple[float, float]]] = None,
     output_dir: Optional[Path] = None,
+    raw_dir: Optional[Path] = None,
     meta_dir: Optional[Path] = None,
     stations_limit: Optional[int] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
@@ -664,8 +745,8 @@ def download_hybrid_cycle(
 ) -> Path:
     """
     Downloads and maps a single forecast cycle for the specified model:
-    - GFS: Pulls from AWS S3 by default (or falls back to Open-Meteo)
-    - ECMWF IFS / JMA GSM: Pulls from Open-Meteo (1 call per location) + Rolling Window lead time
+    - GFS: Pulls from AWS S3 by default (or falls back to Open-Meteo) with raw checkpointing
+    - ECMWF IFS / JMA GSM: Pulls from Open-Meteo (1 call per location, raw JSON cached) + Rolling Window lead time
     """
     model_key = resolve_model_key(model)
     out_dir = Path(output_dir) if output_dir else DEFAULT_OUT_NWP_DIR
@@ -687,6 +768,7 @@ def download_hybrid_cycle(
                 date_str=date_str,
                 cycle_str=cycle_str,
                 coords=coords,
+                raw_dir=raw_dir,
                 max_lead_hours=max_lead_hours,
             )
         except Exception as e:
@@ -700,6 +782,7 @@ def download_hybrid_cycle(
             date_str=date_str,
             cycle_str=cycle_str,
             coords=coords,
+            raw_dir=raw_dir,
             max_lead_hours=max_lead_hours,
         )
 
@@ -715,6 +798,7 @@ def run_hybrid_batch(
     locations: Optional[List[Tuple[float, float]]] = None,
     cycles: Optional[List[str]] = None,
     output_dir: Optional[Path] = None,
+    raw_dir: Optional[Path] = None,
     meta_dir: Optional[Path] = None,
     stations_limit: Optional[int] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
@@ -722,8 +806,8 @@ def run_hybrid_batch(
 ) -> List[Path]:
     """
     Executes batch download across a date range:
-    - GFS: directly from AWS S3 (noaa-gfs-bdp-pds) by default
-    - ECMWF IFS / JMA GSM: strictly 1 call per single location from Open-Meteo Historical Forecast API
+    - GFS: directly from AWS S3 (noaa-gfs-bdp-pds) with raw lead checkpoints to allow resuming
+    - ECMWF IFS / JMA GSM: strictly 1 call per single location from Open-Meteo with raw JSON checkpointing
     """
     cycles = cycles or DEFAULT_CYCLES
     out_dir = Path(output_dir) if output_dir else DEFAULT_OUT_NWP_DIR
@@ -750,6 +834,7 @@ def run_hybrid_batch(
                             cycle_str=cycle_s,
                             locations=coords,
                             output_dir=out_dir,
+                            raw_dir=raw_dir,
                             meta_dir=meta_dir,
                             stations_limit=stations_limit,
                             max_lead_hours=max_lead_hours,
@@ -761,7 +846,7 @@ def run_hybrid_batch(
                         logger.error("Failed cycle %s %s for %s: %s", date_s, cycle_s, model_key, exc)
         else:
             # Open-Meteo models (ECMWF IFS, JMA GSM, or fallback GFS):
-            # Query strictly 1 call per single location for the requested date window
+            # Query strictly 1 call per single location for the requested date window with raw JSON caching
             try:
                 om_files = download_open_meteo_date_range(
                     model_key=model_key,
@@ -770,6 +855,7 @@ def run_hybrid_batch(
                     cycles=cycles,
                     coords=coords,
                     output_dir=out_dir,
+                    raw_dir=raw_dir,
                     max_lead_hours=max_lead_hours,
                 )
                 for f in om_files:
@@ -831,6 +917,7 @@ def main():
     parser.add_argument("--cycles", nargs="+", default=DEFAULT_CYCLES, help="Forecast cycles (e.g. 00:00 12:00)")
     parser.add_argument("--max-lead", type=int, default=DEFAULT_MAX_LEAD, help="Max lead time hours (default: 24)")
     parser.add_argument("--out-dir", type=str, default=str(DEFAULT_OUT_NWP_DIR), help="Output directory for processed parquet cycles")
+    parser.add_argument("--raw-dir", type=str, default=str(DEFAULT_RAW_NWP_DIR), help="Output directory for raw checkpoints (JSON for Open-Meteo, JSON lead checkpoints for GFS)")
     parser.add_argument("--meta-dir", type=str, default=str(DEFAULT_HII_META_DIR), help="HII metadata directory")
     parser.add_argument("--gfs-source", choices=["aws", "openmeteo"], default="aws", help="Data source for GFS (default: aws)")
     parser.add_argument("--lat", type=float, default=None, help="Single target latitude")
@@ -874,6 +961,7 @@ def main():
         locations=custom_coords,
         cycles=args.cycles,
         output_dir=Path(args.out_dir),
+        raw_dir=Path(args.raw_dir),
         meta_dir=Path(args.meta_dir),
         stations_limit=stn_limit,
         max_lead_hours=args.max_lead,
