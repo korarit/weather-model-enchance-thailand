@@ -352,20 +352,21 @@ def download_gfs_cycle_from_aws(
 # PART 2: OPEN-METEO ECMWF IFS (AND FALLBACK GFS) DOWNLOADER
 # =============================================================================
 
-def fetch_open_meteo_batch(
-    locations: List[Tuple[float, float]],
+def fetch_open_meteo_single(
+    lat: float,
+    lon: float,
     model_key: str,
     start_date: str,
     end_date: str,
     max_retries: int = 3,
     retry_delay: float = 2.0,
-) -> List[Dict[str, Any]]:
-    """Fetches historical forecast time series from Open-Meteo for a batch of locations."""
+) -> Dict[str, Any]:
+    """
+    Fetches historical forecast time series from Open-Meteo for a single location (1 API call = 1 coordinate).
+    Never batches multiple coordinates into a single request.
+    """
     model_cfg = SUPPORTED_HYBRID_MODELS[model_key]
     om_model = model_cfg["open_meteo_model"]
-
-    lats_str = ",".join(f"{lat:.4f}" for lat, _ in locations)
-    lons_str = ",".join(f"{lon:.4f}" for _, lon in locations)
 
     hourly_vars = [
         "precipitation",
@@ -378,8 +379,8 @@ def fetch_open_meteo_batch(
     ]
 
     params = {
-        "latitude": lats_str,
-        "longitude": lons_str,
+        "latitude": f"{lat:.4f}",
+        "longitude": f"{lon:.4f}",
         "start_date": start_date,
         "end_date": end_date,
         "hourly": ",".join(hourly_vars),
@@ -397,20 +398,22 @@ def fetch_open_meteo_batch(
             resp = requests.get(OPEN_METEO_HISTORICAL_URL, params=params, headers=headers, timeout=60)
             if resp.status_code == 200:
                 data = resp.json()
-                return data if isinstance(data, list) else [data]
+                if isinstance(data, list):
+                    return data[0] if data else {}
+                return data
             elif resp.status_code in (429, 500, 502, 503, 504):
-                logger.warning("Open-Meteo HTTP %d on attempt %d/%d. Waiting %.1fs...",
-                               resp.status_code, attempt, max_retries, retry_delay)
+                logger.warning("Open-Meteo HTTP %d for (%.4f, %.4f) on attempt %d/%d. Waiting %.1fs...",
+                               resp.status_code, lat, lon, attempt, max_retries, retry_delay)
                 time.sleep(retry_delay * attempt)
             else:
                 resp.raise_for_status()
         except Exception as exc:
             last_error = exc
-            logger.warning("Request error on attempt %d/%d: %s. Retrying in %.1fs...",
-                           attempt, max_retries, exc, retry_delay)
+            logger.warning("Open-Meteo request error for (%.4f, %.4f) on attempt %d/%d: %s. Retrying in %.1fs...",
+                           lat, lon, attempt, max_retries, exc, retry_delay)
             time.sleep(retry_delay * attempt)
 
-    raise RuntimeError(f"Failed to fetch data from Open-Meteo after {max_retries} attempts: {last_error}")
+    raise RuntimeError(f"Failed to fetch data from Open-Meteo for ({lat:.4f}, {lon:.4f}) after {max_retries} attempts: {last_error}")
 
 
 def map_rolling_window_to_cycles(
@@ -497,9 +500,12 @@ def download_open_meteo_cycle(
     cycle_str: str,
     coords: List[Tuple[float, float]],
     max_lead_hours: int = DEFAULT_MAX_LEAD,
-    batch_size: int = 25,
+    delay_between_calls: float = 0.1,
 ) -> pd.DataFrame:
-    """Downloads and maps a single forecast cycle from Open-Meteo."""
+    """
+    Downloads and maps a single forecast cycle from Open-Meteo.
+    Strictly performs 1 API call per single coordinate pair (1 call 1 พิกัด).
+    """
     start_dt = pd.to_datetime(date_str)
     end_dt = start_dt + pd.Timedelta(days=math.ceil((max_lead_hours + 12) / 24.0))
 
@@ -509,16 +515,18 @@ def download_open_meteo_cycle(
     target_run_time = pd.Timestamp(f"{date_str} {cycle_str}")
     all_dfs = []
 
-    for i in range(0, len(coords), batch_size):
-        chunk = coords[i: i + batch_size]
-        responses = fetch_open_meteo_batch(
-            locations=chunk,
-            model_key=model_key,
-            start_date=start_str,
-            end_date=end_str,
-        )
-        for loc_idx, loc_resp in enumerate(responses):
-            lat, lon = chunk[loc_idx] if loc_idx < len(chunk) else (loc_resp.get("latitude", 0.0), loc_resp.get("longitude", 0.0))
+    logger.info("Fetching [%s] via Open-Meteo for cycle %s %s (1 call per location, total %d locations)...",
+                model_key.upper(), date_str, cycle_str, len(coords))
+
+    for idx, (lat, lon) in enumerate(coords, start=1):
+        try:
+            loc_resp = fetch_open_meteo_single(
+                lat=lat,
+                lon=lon,
+                model_key=model_key,
+                start_date=start_str,
+                end_date=end_str,
+            )
             cycle_df = map_rolling_window_to_cycles(
                 hourly_data=loc_resp,
                 lat=lat,
@@ -531,12 +539,112 @@ def download_open_meteo_cycle(
                 cycle_filtered = cycle_df[cycle_df["run_time"] == target_run_time]
                 if not cycle_filtered.empty:
                     all_dfs.append(cycle_filtered)
-        time.sleep(0.1)
+        except Exception as exc:
+            logger.warning("Failed Open-Meteo fetch for location (%.4f, %.4f) on %s %s: %s",
+                           lat, lon, date_str, cycle_str, exc)
+
+        if delay_between_calls > 0 and idx < len(coords):
+            time.sleep(delay_between_calls)
 
     if not all_dfs:
         raise RuntimeError(f"No records retrieved from Open-Meteo for {model_key} on {date_str} {cycle_str}")
 
     return pd.concat(all_dfs, ignore_index=True)
+
+
+def download_open_meteo_date_range(
+    model_key: str,
+    start_date: str,
+    end_date: str,
+    cycles: List[str],
+    coords: List[Tuple[float, float]],
+    output_dir: Path,
+    max_lead_hours: int = DEFAULT_MAX_LEAD,
+    delay_between_calls: float = 0.1,
+) -> List[Path]:
+    """
+    Downloads and maps Open-Meteo forecasts across a date range.
+    Queries Open-Meteo strictly 1 API call per single coordinate pair (1 call 1 พิกัด)
+    for the requested date window, then maps to all requested forecast cycles.
+    """
+    model_out_dir = output_dir / model_key
+    model_out_dir.mkdir(parents=True, exist_ok=True)
+
+    start_dt = pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date)
+    api_end_dt = end_dt + pd.Timedelta(days=math.ceil((max_lead_hours + 12) / 24.0))
+
+    start_str = start_dt.strftime("%Y-%m-%d")
+    api_end_str = api_end_dt.strftime("%Y-%m-%d")
+
+    date_list = pd.date_range(start_dt, end_dt, freq="D").strftime("%Y-%m-%d").tolist()
+
+    needed_cycles = []
+    for d_str in date_list:
+        for c_str in cycles:
+            cycle_clean = c_str.replace(":", "")[:2]
+            out_file = model_out_dir / f"run_{d_str.replace('-', '')}_{cycle_clean}z.parquet"
+            if not out_file.exists():
+                needed_cycles.append((d_str, c_str, out_file))
+
+    if not needed_cycles:
+        logger.info("[Cached] All %d Open-Meteo cycle file(s) for [%s] already exist in %s",
+                    len(date_list) * len(cycles), model_key.upper(), model_out_dir)
+        return [
+            model_out_dir / f"run_{d_str.replace('-', '')}_{c_str.replace(':', '')[:2]}z.parquet"
+            for d_str in date_list for c_str in cycles
+        ]
+
+    logger.info("Ingesting [%s] via Open-Meteo (1 call per location, %d location(s), %s to %s)...",
+                model_key.upper(), len(coords), start_str, end_date)
+
+    location_dfs = []
+    for idx, (lat, lon) in enumerate(coords, start=1):
+        try:
+            loc_resp = fetch_open_meteo_single(
+                lat=lat,
+                lon=lon,
+                model_key=model_key,
+                start_date=start_str,
+                end_date=api_end_str,
+            )
+            df_loc = map_rolling_window_to_cycles(
+                hourly_data=loc_resp,
+                lat=lat,
+                lon=lon,
+                origin=model_key,
+                cycles=cycles,
+                max_lead_hours=max_lead_hours,
+            )
+            if not df_loc.empty:
+                location_dfs.append(df_loc)
+        except Exception as exc:
+            logger.warning("Failed Open-Meteo fetch for location (%.4f, %.4f): %s", lat, lon, exc)
+
+        if delay_between_calls > 0 and idx < len(coords):
+            time.sleep(delay_between_calls)
+
+    if not location_dfs:
+        raise RuntimeError(f"Failed to fetch Open-Meteo data for any locations for {model_key}")
+
+    df_combined = pd.concat(location_dfs, ignore_index=True)
+
+    saved_files = []
+    for d_str in date_list:
+        for c_str in cycles:
+            cycle_clean = c_str.replace(":", "")[:2]
+            out_file = model_out_dir / f"run_{d_str.replace('-', '')}_{cycle_clean}z.parquet"
+            target_run_time = pd.Timestamp(f"{d_str} {c_str}")
+
+            cycle_data = df_combined[df_combined["run_time"] == target_run_time]
+            if not cycle_data.empty:
+                cycle_data.to_parquet(out_file, index=False, compression="snappy")
+                logger.info("Saved Hybrid NWP cycle artifact: %s (%d rows)", out_file, len(cycle_data))
+                saved_files.append(out_file)
+            elif out_file.exists():
+                saved_files.append(out_file)
+
+    return saved_files
 
 
 # =============================================================================
@@ -557,7 +665,7 @@ def download_hybrid_cycle(
     """
     Downloads and maps a single forecast cycle for the specified model:
     - GFS: Pulls from AWS S3 by default (or falls back to Open-Meteo)
-    - ECMWF IFS / JMA GSM: Pulls from Open-Meteo + Rolling Window lead time
+    - ECMWF IFS / JMA GSM: Pulls from Open-Meteo (1 call per location) + Rolling Window lead time
     """
     model_key = resolve_model_key(model)
     out_dir = Path(output_dir) if output_dir else DEFAULT_OUT_NWP_DIR
@@ -586,7 +694,7 @@ def download_hybrid_cycle(
 
     if df_result is None or df_result.empty:
         # ECMWF IFS, JMA GSM, or GFS fallback
-        logger.info("Fetching [%s] via Open-Meteo Historical Forecast API...", model_key.upper())
+        logger.info("Fetching [%s] via Open-Meteo Historical Forecast API (1 call per location)...", model_key.upper())
         df_result = download_open_meteo_cycle(
             model_key=model_key,
             date_str=date_str,
@@ -614,8 +722,8 @@ def run_hybrid_batch(
 ) -> List[Path]:
     """
     Executes batch download across a date range:
-    - GFS: directly from AWS S3 (noaa-gfs-bdp-pds)
-    - ECMWF IFS / JMA GSM: from Open-Meteo Historical Forecast API
+    - GFS: directly from AWS S3 (noaa-gfs-bdp-pds) by default
+    - ECMWF IFS / JMA GSM: strictly 1 call per single location from Open-Meteo Historical Forecast API
     """
     cycles = cycles or DEFAULT_CYCLES
     out_dir = Path(output_dir) if output_dir else DEFAULT_OUT_NWP_DIR
@@ -632,24 +740,43 @@ def run_hybrid_batch(
         logger.info("=== Running Hybrid Batch for [%s] (%s to %s, %d locations) ===",
                     model_key.upper(), start_date, end_date, len(coords))
 
-        for date_s in date_list:
-            for cycle_s in cycles:
-                try:
-                    f = download_hybrid_cycle(
-                        model=model_key,
-                        date_str=date_s,
-                        cycle_str=cycle_s,
-                        locations=coords,
-                        output_dir=out_dir,
-                        meta_dir=meta_dir,
-                        stations_limit=stations_limit,
-                        max_lead_hours=max_lead_hours,
-                        gfs_source=gfs_source,
-                    )
+        if model_key == "gfs" and gfs_source.lower() == "aws":
+            for date_s in date_list:
+                for cycle_s in cycles:
+                    try:
+                        f = download_hybrid_cycle(
+                            model=model_key,
+                            date_str=date_s,
+                            cycle_str=cycle_s,
+                            locations=coords,
+                            output_dir=out_dir,
+                            meta_dir=meta_dir,
+                            stations_limit=stations_limit,
+                            max_lead_hours=max_lead_hours,
+                            gfs_source=gfs_source,
+                        )
+                        if f and f.exists() and f not in saved_files:
+                            saved_files.append(f)
+                    except Exception as exc:
+                        logger.error("Failed cycle %s %s for %s: %s", date_s, cycle_s, model_key, exc)
+        else:
+            # Open-Meteo models (ECMWF IFS, JMA GSM, or fallback GFS):
+            # Query strictly 1 call per single location for the requested date window
+            try:
+                om_files = download_open_meteo_date_range(
+                    model_key=model_key,
+                    start_date=start_date,
+                    end_date=end_date,
+                    cycles=cycles,
+                    coords=coords,
+                    output_dir=out_dir,
+                    max_lead_hours=max_lead_hours,
+                )
+                for f in om_files:
                     if f and f.exists() and f not in saved_files:
                         saved_files.append(f)
-                except Exception as exc:
-                    logger.error("Failed cycle %s %s for %s: %s", date_s, cycle_s, model_key, exc)
+            except Exception as exc:
+                logger.error("Failed Open-Meteo date range download for %s: %s", model_key, exc)
 
     logger.info("Hybrid acquisition complete. Saved %d cycle file(s).", len(saved_files))
     return saved_files
