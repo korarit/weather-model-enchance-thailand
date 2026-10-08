@@ -48,6 +48,7 @@ def run_full_pipeline(
     model_name: str = "catboost",
     weather_model: str = "ecmwf_ifs",
     ablation: str = "m1",
+    downloader: str = "tigge",
     smoke_test: bool = True,
     skip_download: bool = False,
 ):
@@ -66,6 +67,7 @@ def run_full_pipeline(
     logger.info("  * NWP Raw Runs       : %s", forecast_paths["raw_nwp_dir"])
     logger.info("  * NWP Forecasts      : %s", forecast_paths["out_nwp_dir"])
     logger.info("  * Himawari Satellite : %s", forecast_paths["himawari_dir"])
+    logger.info("  * Downloader Backend : %s", downloader.upper())
     logger.info("  * Pipeline Output    : %s", out_base)
 
     # -------------------------------------------------------------------------
@@ -98,25 +100,38 @@ def run_full_pipeline(
     # -------------------------------------------------------------------------
     # STAGE 3: NWP Forecasts & Himawari-9 Satellite Data
     # -------------------------------------------------------------------------
-    print_stage_banner(3, total_stages, "Extracting NWP Global Forecasts & Himawari-9 Satellite")
+    print_stage_banner(3, total_stages, f"Extracting NWP Global Forecasts ({downloader.upper()}) & Himawari-9 Satellite")
     if skip_download:
         logger.info("Skip-download active: Bypassing NWP/Satellite acquisition.")
     else:
-        # Download NWP
-        from src.data.tigge_downloader import run_batch_acquisition
-        origins = [weather_model] if weather_model != "all" else ["ecmf", "kwbc"]
-        run_batch_acquisition(
-            dates=["2021-01-01", "2021-01-02"] if smoke_test else ["2021-01-01", "2021-01-05"],
-            origins=origins,
-            output_dir=forecast_paths["raw_nwp_dir"]
-        )
+        if downloader == "hybrid":
+            from src.data.hybrid_downloader import run_hybrid_batch
+            target_models = ["ecmwf_ifs", "gfs"] if weather_model == "all" else [
+                "ecmwf_ifs" if weather_model in ("ecmwf_ifs", "ecmf", "ecmwf") else "gfs"
+            ]
+            run_hybrid_batch(
+                models=target_models,
+                start_date="2021-01-01",
+                end_date="2021-01-02" if smoke_test else "2021-01-05",
+                output_dir=forecast_paths["out_nwp_dir"],
+                meta_dir=hii_paths["meta_dir"],
+            )
+        else:
+            # Standard TIGGE flow
+            from src.data.tigge_downloader import run_batch_acquisition
+            origins = [weather_model] if weather_model != "all" else ["ecmf", "kwbc"]
+            run_batch_acquisition(
+                dates=["2021-01-01", "2021-01-02"] if smoke_test else ["2021-01-01", "2021-01-05"],
+                origins=origins,
+                output_dir=forecast_paths["raw_nwp_dir"]
+            )
 
-        # Extract NWP to analysis-ready
-        from src.data.tigge_extractor import run_extraction_pipeline
-        run_extraction_pipeline(
-            raw_dir=forecast_paths["raw_nwp_dir"],
-            out_dir=forecast_paths["out_nwp_dir"]
-        )
+            # Extract NWP to analysis-ready
+            from src.data.tigge_extractor import run_extraction_pipeline
+            run_extraction_pipeline(
+                raw_dir=forecast_paths["raw_nwp_dir"],
+                out_dir=forecast_paths["out_nwp_dir"]
+            )
 
         # Extract satellite
         from src.data.himawari_extractor import run_himawari_acquisition
@@ -141,6 +156,7 @@ def run_full_pipeline(
         raw_nwp_dir=forecast_paths["raw_nwp_dir"],
         out_nwp_dir=forecast_paths["out_nwp_dir"],
         himawari_dir=forecast_paths["himawari_dir"],
+        downloader=downloader,
     )
     logger.info("Feature matrix ready at: %s", feature_parquet)
 
@@ -222,6 +238,7 @@ def main():
     parser.add_argument("--model", choices=["catboost", "lightgbm", "hurdle", "quantile", "stgnn", "unet", "linknet", "fpn"], default="catboost", help="ML Architecture")
     parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "all"], default="ecmwf_ifs", help="Target Weather Model")
     parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default="m1", help="Feature ablation variant")
+    parser.add_argument("--downloader", choices=["tigge", "hybrid"], default="tigge", help="NWP downloader backend ('tigge' or 'hybrid')")
     parser.add_argument("--smoke-test", action="store_true", default=True, help="Fast smoke test mode")
     parser.add_argument("--full", action="store_true", help="Production full mode (disables smoke-test)")
     parser.add_argument("--skip-download", action="store_true", help="Skip download stages if files already exist")
@@ -236,6 +253,7 @@ def main():
         model_name=args.model,
         weather_model=args.weather_model,
         ablation=args.ablation,
+        downloader=args.downloader,
         smoke_test=smoke,
         skip_download=args.skip_download,
     )

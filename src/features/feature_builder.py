@@ -230,6 +230,7 @@ def build_feature_matrices(
     raw_nwp_dir: Path = DEFAULT_RAW_NWP_DIR,
     out_nwp_dir: Path = DEFAULT_OUT_NWP_DIR,
     himawari_dir: Path = DEFAULT_HIMAWARI_DIR,
+    downloader: str = "tigge",
     process_all: bool = False,
     combine: bool = True,
     overwrite: bool = False,
@@ -240,7 +241,7 @@ def build_feature_matrices(
     If process_all=True, processes all available NWP forecast cycles and optionally merges them.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("=== Starting Multi-Modal Feature Assembly Pipeline (process_all=%s) ===", process_all)
+    logger.info("=== Starting Multi-Modal Feature Assembly Pipeline (downloader=%s, process_all=%s) ===", downloader, process_all)
 
     logger.info("[Feature Step 1/4] Loading Thailand 2 km Master Grid from %s...", geo_dir)
     grid_df = load_master_grid(geo_dir=geo_dir)
@@ -251,19 +252,31 @@ def build_feature_matrices(
     indexer = SpatialObservationIndexer(stn_meta_df)
     stn_codes = stn_meta_df["station_code"].dropna().head(100).tolist()
 
-    logger.info("[Feature Step 3/4] Ingesting NWP Forecast cycles and Himawari-9 satellite features...")
+    logger.info("[Feature Step 3/4] Ingesting NWP Forecast cycles (downloader=%s) and Himawari-9 satellite features...", downloader)
     # Find existing processed NWP forecasts or run extraction
     nwp_files = sorted(list(out_nwp_dir.glob("**/*.parquet")))
     if not nwp_files:
-        from src.data.tigge_extractor import run_extraction_pipeline
-        nwp_files = run_extraction_pipeline(raw_dir=raw_nwp_dir, out_dir=out_nwp_dir)
+        if downloader == "hybrid":
+            logger.info("No processed NWP files found. Triggering Hybrid Downloader (Open-Meteo ECMWF IFS & GFS)...")
+            from src.data.hybrid_downloader import download_hybrid_cycle
+            sample_pq = download_hybrid_cycle(
+                model="ecmwf_ifs",
+                date_str="2021-01-01",
+                cycle_str="00:00",
+                output_dir=out_nwp_dir,
+                meta_dir=hii_meta_dir,
+            )
+            nwp_files = [sample_pq] if sample_pq.exists() else []
+        else:
+            from src.data.tigge_extractor import run_extraction_pipeline
+            nwp_files = run_extraction_pipeline(raw_dir=raw_nwp_dir, out_dir=out_nwp_dir)
 
-    if not nwp_files:
-        from src.data.tigge_downloader import download_tigge_cycle
-        raw_p = download_tigge_cycle("ecmf", "2021-01-01", "00:00", output_dir=raw_nwp_dir)
-        from src.data.tigge_extractor import process_raw_nwp_file
-        nwp_pq = process_raw_nwp_file(raw_p, output_base_dir=out_nwp_dir)
-        nwp_files = [nwp_pq] if nwp_pq else []
+            if not nwp_files:
+                from src.data.tigge_downloader import download_tigge_cycle
+                raw_p = download_tigge_cycle("ecmf", "2021-01-01", "00:00", output_dir=raw_nwp_dir)
+                from src.data.tigge_extractor import process_raw_nwp_file
+                nwp_pq = process_raw_nwp_file(raw_p, output_base_dir=out_nwp_dir)
+                nwp_files = [nwp_pq] if nwp_pq else []
 
     target_files = nwp_files if process_all else (nwp_files[:1] if nwp_files else [])
     if not target_files:
@@ -336,6 +349,7 @@ def run_sample_builder(
     raw_nwp_dir: Path = DEFAULT_RAW_NWP_DIR,
     out_nwp_dir: Path = DEFAULT_OUT_NWP_DIR,
     himawari_dir: Path = DEFAULT_HIMAWARI_DIR,
+    downloader: str = "tigge",
     overwrite: bool = False,
 ) -> Path:
     """Executes single sample cycle feature assembly (backward compatible)."""
@@ -347,6 +361,7 @@ def run_sample_builder(
         raw_nwp_dir=raw_nwp_dir,
         out_nwp_dir=out_nwp_dir,
         himawari_dir=himawari_dir,
+        downloader=downloader,
         process_all=False,
         combine=False,
         overwrite=overwrite,
@@ -366,6 +381,13 @@ def main():
     parser.add_argument("--raw-nwp-dir", type=str, default=None, help="Raw NWP runs directory")
     parser.add_argument("--out-nwp-dir", type=str, default=None, help="Processed NWP forecasts directory")
     parser.add_argument("--himawari-dir", type=str, default=None, help="Himawari satellite data directory")
+    parser.add_argument(
+        "--downloader",
+        type=str,
+        choices=["tigge", "hybrid"],
+        default="tigge",
+        help="NWP forecast downloader backend ('tigge' or 'hybrid')",
+    )
 
     # Common & Output arguments
     parser.add_argument("--geo-dir", type=str, default=str(DEFAULT_GEO_DIR), help="Master grid geo directory")
@@ -391,6 +413,7 @@ def main():
         raw_nwp_dir=forecast_paths["raw_nwp_dir"],
         out_nwp_dir=forecast_paths["out_nwp_dir"],
         himawari_dir=forecast_paths["himawari_dir"],
+        downloader=args.downloader,
         process_all=args.all,
         combine=args.combine,
         overwrite=args.overwrite,
