@@ -43,7 +43,10 @@ GROUND_FEATURES = [
     "rain_mean_5_10km", "rain_max_5_10km",
     "pressure_mean_5_10km", "humidity_mean_5_10km",
     "pressure_mean_20_50km", "humidity_mean_20_50km",
-    "pressure_gradient_mag", "humidity_gradient_mag"
+    "pressure_gradient_mag", "humidity_gradient_mag",
+    "nearest_rain_val", "nearest_rain_dist_km", "nearest_rain_bearing_sin", "nearest_rain_bearing_cos",
+    "nearest_pressure_val", "nearest_pressure_dist_km", "nearest_pressure_bearing_sin", "nearest_pressure_bearing_cos",
+    "nearest_humidity_val", "nearest_humidity_dist_km", "nearest_humidity_bearing_sin", "nearest_humidity_bearing_cos",
 ]
 
 SATELLITE_FEATURES = [
@@ -241,6 +244,18 @@ def generate_smoke_test_dataset(
             "humidity_mean_20_50km": float(round(np.random.uniform(60.0, 95.0), 1)),
             "pressure_gradient_mag": float(round(np.random.uniform(0.5, 8.0), 2)),
             "humidity_gradient_mag": float(round(np.random.uniform(1.0, 15.0), 2)),
+            "nearest_rain_val": float(round(max(0.0, nwp_rain + np.random.normal(0, 0.4)), 2)),
+            "nearest_rain_dist_km": float(round(np.random.uniform(2.1, 8.0), 2)),
+            "nearest_rain_bearing_sin": float(round(np.random.uniform(-1.0, 1.0), 4)),
+            "nearest_rain_bearing_cos": float(round(np.random.uniform(-1.0, 1.0), 4)),
+            "nearest_pressure_val": float(round(np.random.normal(1008.0, 2.0), 1)),
+            "nearest_pressure_dist_km": float(round(np.random.uniform(2.5, 15.0), 2)),
+            "nearest_pressure_bearing_sin": float(round(np.random.uniform(-1.0, 1.0), 4)),
+            "nearest_pressure_bearing_cos": float(round(np.random.uniform(-1.0, 1.0), 4)),
+            "nearest_humidity_val": float(round(np.random.uniform(60.0, 95.0), 1)),
+            "nearest_humidity_dist_km": float(round(np.random.uniform(2.5, 15.0), 2)),
+            "nearest_humidity_bearing_sin": float(round(np.random.uniform(-1.0, 1.0), 4)),
+            "nearest_humidity_bearing_cos": float(round(np.random.uniform(-1.0, 1.0), 4)),
             "bt_mean_t0": float(round(np.random.uniform(210.0, 295.0), 1)),
             "bt_min_t0": float(round(np.random.uniform(200.0, 290.0), 1)),
             "bt_std": float(round(np.random.uniform(0.5, 5.0), 2)),

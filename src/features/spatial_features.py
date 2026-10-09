@@ -189,6 +189,49 @@ class SpatialObservationIndexer:
         features["pressure_gradient_mag"] = float(p_grad_mag)
         features["humidity_gradient_mag"] = float(h_grad_mag)
 
+        # Variable-Specific Nearest Neighbor Imputation & Polar Geometry:
+        # Handles incomplete station telemetry (e.g. closest Station A has rain only, while Station B has pressure/humidity).
+        # Finds the nearest valid station independently for each variable and records its exact distance and bearing.
+        var_specs = [
+            ("rain", rains, 0.0),
+            ("pressure", pressures, 1010.0),
+            ("humidity", humidities, 70.0),
+        ]
+
+        for var_name, vals, fallback_val in var_specs:
+            valid_var_mask = ~np.isnan(vals)
+            if np.any(valid_var_mask):
+                v_dists = keep_dists[valid_var_mask]
+                v_offsets = keep_offsets[valid_var_mask]
+                v_vals = vals[valid_var_mask]
+
+                closest_idx = np.argmin(v_dists)
+                features[f"nearest_{var_name}_val"] = float(v_vals[closest_idx])
+                features[f"nearest_{var_name}_dist_km"] = float(v_dists[closest_idx])
+                dx, dy = v_offsets[closest_idx]
+                var_bearing = np.arctan2(dx, dy)
+                features[f"nearest_{var_name}_bearing_sin"] = float(np.sin(var_bearing))
+                features[f"nearest_{var_name}_bearing_cos"] = float(np.cos(var_bearing))
+            else:
+                features[f"nearest_{var_name}_val"] = float(fallback_val)
+                features[f"nearest_{var_name}_dist_km"] = 50.0
+                features[f"nearest_{var_name}_bearing_sin"] = 0.0
+                features[f"nearest_{var_name}_bearing_cos"] = 1.0
+
+        # Robust Fallback Imputation for Band Means to prevent NaNs
+        if np.isnan(features.get("pressure_mean_2_5km", np.nan)):
+            features["pressure_mean_2_5km"] = features["nearest_pressure_val"]
+        if np.isnan(features.get("humidity_mean_2_5km", np.nan)):
+            features["humidity_mean_2_5km"] = features["nearest_humidity_val"]
+        if np.isnan(features.get("pressure_mean_5_10km", np.nan)):
+            features["pressure_mean_5_10km"] = features["nearest_pressure_val"]
+        if np.isnan(features.get("humidity_mean_5_10km", np.nan)):
+            features["humidity_mean_5_10km"] = features["nearest_humidity_val"]
+        if np.isnan(features.get("pressure_mean_20_50km", np.nan)):
+            features["pressure_mean_20_50km"] = features["nearest_pressure_val"]
+        if np.isnan(features.get("humidity_mean_20_50km", np.nan)):
+            features["humidity_mean_20_50km"] = features["nearest_humidity_val"]
+
         return features
 
     @staticmethod
@@ -222,19 +265,31 @@ class SpatialObservationIndexer:
         return {
             "rain_mean_2_5km": 0.0,
             "rain_max_2_5km": 0.0,
-            "pressure_mean_2_5km": np.nan,
+            "pressure_mean_2_5km": 1010.0,
             "pressure_std_2_5km": 0.0,
-            "humidity_mean_2_5km": np.nan,
+            "humidity_mean_2_5km": 70.0,
             "humidity_std_2_5km": 0.0,
             "nearest_stn_dist_2_5km": 5.0,
             "nearest_stn_bearing_sin": 0.0,
             "nearest_stn_bearing_cos": 1.0,
             "rain_mean_5_10km": 0.0,
             "rain_max_5_10km": 0.0,
-            "pressure_mean_5_10km": np.nan,
-            "humidity_mean_5_10km": np.nan,
-            "pressure_mean_20_50km": np.nan,
-            "humidity_mean_20_50km": np.nan,
+            "pressure_mean_5_10km": 1010.0,
+            "humidity_mean_5_10km": 70.0,
+            "pressure_mean_20_50km": 1010.0,
+            "humidity_mean_20_50km": 70.0,
             "pressure_gradient_mag": 0.0,
             "humidity_gradient_mag": 0.0,
+            "nearest_rain_val": 0.0,
+            "nearest_rain_dist_km": 50.0,
+            "nearest_rain_bearing_sin": 0.0,
+            "nearest_rain_bearing_cos": 1.0,
+            "nearest_pressure_val": 1010.0,
+            "nearest_pressure_dist_km": 50.0,
+            "nearest_pressure_bearing_sin": 0.0,
+            "nearest_pressure_bearing_cos": 1.0,
+            "nearest_humidity_val": 70.0,
+            "nearest_humidity_dist_km": 50.0,
+            "nearest_humidity_bearing_sin": 0.0,
+            "nearest_humidity_bearing_cos": 1.0,
         }

@@ -106,13 +106,78 @@ def test_gradient_magnitude_non_negative():
     print(f"  [PASS] Atmospheric pressure gradient calculated correctly: {mag:.2f} hPa/100km.")
 
 
+def test_variable_specific_nearest_telemetry():
+    """
+    Tests that when closest stations have incomplete telemetry (e.g. Stn A has rain only),
+    missing pressure and humidity are automatically retrieved from the next closest valid stations,
+    and their independent distances and bearings are recorded accurately.
+    """
+    to_utm, to_wgs = get_transformers()
+    x0, y0 = to_utm.transform(100.50, 13.75)
+
+    # Stn A is 3.0 km North (dx=0, dy=+3000m) -> ONLY rain
+    lon_a, lat_a = to_wgs.transform(x0, y0 + 3000.0)
+    # Stn B is 7.0 km East (dx=+7000m, dy=0) -> ONLY pressure
+    lon_b, lat_b = to_wgs.transform(x0 + 7000.0, y0)
+    # Stn C is 12.0 km South (dx=0, dy=-12000m) -> ONLY humidity
+    lon_c, lat_c = to_wgs.transform(x0, y0 - 12000.0)
+
+    stn_df = pd.DataFrame({
+        "station_code": ["STN_RAIN_ONLY", "STN_PRESSURE_ONLY", "STN_HUMIDITY_ONLY"],
+        "latitude": [lat_a, lat_b, lat_c],
+        "longitude": [lon_a, lon_b, lon_c],
+    })
+
+    indexer = SpatialObservationIndexer(stn_df)
+    obs_dict = {
+        "STN_RAIN_ONLY": {"hourly_rain": 15.0},
+        "STN_PRESSURE_ONLY": {"pressure": 1006.5},
+        "STN_HUMIDITY_ONLY": {"humidity": 88.0},
+    }
+
+    feats = indexer.extract_grid_spatial_features(13.75, 100.50, obs_dict)
+
+    # 1. Rain should come from Stn A (3 km away)
+    assert np.isclose(feats["nearest_rain_val"], 15.0), f"Expected 15.0, got {feats['nearest_rain_val']}"
+    assert np.isclose(feats["nearest_rain_dist_km"], 3.0, atol=0.1), f"Expected 3.0 km, got {feats['nearest_rain_dist_km']}"
+
+    # 2. Pressure should be fetched from next closest Stn B (7 km away, not Stn A)
+    assert np.isclose(feats["nearest_pressure_val"], 1006.5), f"Expected 1006.5, got {feats['nearest_pressure_val']}"
+    assert np.isclose(feats["nearest_pressure_dist_km"], 7.0, atol=0.1), f"Expected 7.0 km, got {feats['nearest_pressure_dist_km']}"
+
+    # 3. Humidity should be fetched from next closest Stn C (12 km away)
+    assert np.isclose(feats["nearest_humidity_val"], 88.0), f"Expected 88.0, got {feats['nearest_humidity_val']}"
+    assert np.isclose(feats["nearest_humidity_dist_km"], 12.0, atol=0.1), f"Expected 12.0 km, got {feats['nearest_humidity_dist_km']}"
+
+    # 4. Bearings must reflect individual directions
+    # Stn A is North -> dx=0, dy=+ -> bearing = 0 rad -> sin=0, cos=1
+    assert np.isclose(feats["nearest_rain_bearing_sin"], 0.0, atol=0.05)
+    assert np.isclose(feats["nearest_rain_bearing_cos"], 1.0, atol=0.05)
+
+    # Stn B is East -> dx=+, dy=0 -> bearing = pi/2 rad -> sin=1, cos=0
+    assert np.isclose(feats["nearest_pressure_bearing_sin"], 1.0, atol=0.05)
+    assert np.isclose(feats["nearest_pressure_bearing_cos"], 0.0, atol=0.05)
+
+    # Stn C is South -> dx=0, dy=- -> bearing = -pi or pi rad -> sin=0, cos=-1
+    assert np.isclose(feats["nearest_humidity_bearing_sin"], 0.0, atol=0.05)
+    assert np.isclose(feats["nearest_humidity_bearing_cos"], -1.0, atol=0.05)
+
+    # 5. Band means should be gracefully imputed from nearest valid station (no NaNs)
+    assert not np.isnan(feats["pressure_mean_2_5km"])
+    assert np.isclose(feats["pressure_mean_2_5km"], 1006.5)
+    assert not np.isnan(feats["humidity_mean_2_5km"])
+    assert np.isclose(feats["humidity_mean_2_5km"], 88.0)
+    print("  [PASS] Variable-specific nearest telemetry fallback & polar tracking verified.")
+
+
 def run_all_tests():
     print("Running Phase 3 Spatial Feature Engine Tests...")
     test_grid_spacing_and_projection()
     test_proximity_exclusion_under_2km()
     test_bearing_trigonometry()
     test_gradient_magnitude_non_negative()
-    print("All Phase 3 Tests Passed Successfully! (4/4)")
+    test_variable_specific_nearest_telemetry()
+    print("All Phase 3 Tests Passed Successfully! (5/5)")
 
 
 if __name__ == "__main__":

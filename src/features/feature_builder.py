@@ -193,9 +193,10 @@ def load_hii_station_observations(
         cat_dir = clean_dir / cat / f"year={year}"
         if not cat_dir.exists():
             continue
+        available_files = {p.stem: p for p in cat_dir.glob("*.parquet")}
         for code in stn_codes:
-            f = cat_dir / f"{code}.parquet"
-            if f.exists():
+            f = available_files.get(code)
+            if f is not None:
                 try:
                     df = pd.read_parquet(f)
                     df["observed_at"] = pd.to_datetime(df["observed_at"])
@@ -250,7 +251,7 @@ def build_feature_matrices(
     logger.info("[Feature Step 2/4] Loading HII Station Metadata and Spatial KDTree Indexer from %s...", hii_meta_dir)
     stn_meta_df = load_stations_metadata(meta_dir=hii_meta_dir)
     indexer = SpatialObservationIndexer(stn_meta_df)
-    stn_codes = stn_meta_df["station_code"].dropna().head(100).tolist()
+    stn_codes = stn_meta_df["station_code"].dropna().tolist()
 
     logger.info("[Feature Step 3/4] Ingesting NWP Forecast cycles (downloader=%s) and Himawari-9 satellite features...", downloader)
     # Find existing processed NWP forecasts or run extraction
