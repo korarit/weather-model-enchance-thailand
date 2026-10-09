@@ -427,21 +427,32 @@ def fetch_open_meteo_single(
     global _GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL, _CURRENT_ADAPTIVE_DELAY
 
     raw_base = Path(raw_dir) if raw_dir else DEFAULT_RAW_NWP_DIR
-    raw_om_dir = raw_base / "openmeteo" / model_key
-    raw_om_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_file = raw_om_dir / f"{model_key}_lat{lat:+.4f}_lon{lon:+.4f}_{start_date}_{end_date}.json"
+    # Support both direct path ({raw_dir}/{model_key}) and legacy nested path ({raw_dir}/openmeteo/{model_key})
+    dir_direct = raw_base / model_key
+    dir_legacy = raw_base / "openmeteo" / model_key
+    dir_direct.mkdir(parents=True, exist_ok=True)
 
-    # Checkpoint check: if raw JSON exists and is non-empty, load from disk
+    fname = f"{model_key}_lat{lat:+.4f}_lon{lon:+.4f}_{start_date}_{end_date}.json"
+    raw_file = dir_direct / fname
+    legacy_file = dir_legacy / fname
+
+    # Checkpoint check: if raw JSON exists in direct or legacy path, load from disk
+    target_cached = None
     if raw_file.exists() and raw_file.stat().st_size > 0:
+        target_cached = raw_file
+    elif legacy_file.exists() and legacy_file.stat().st_size > 0:
+        target_cached = legacy_file
+
+    if target_cached is not None:
         try:
-            with open(raw_file, "r", encoding="utf-8") as f:
+            with open(target_cached, "r", encoding="utf-8") as f:
                 cached_data = json.load(f)
             if isinstance(cached_data, dict) and "hourly" in cached_data and cached_data["hourly"].get("time"):
-                logger.info("[Cached Raw] Loaded Open-Meteo JSON for (%.4f, %.4f) from %s", lat, lon, raw_file.name)
+                logger.info("[Cached Raw] Loaded Open-Meteo JSON for (%.4f, %.4f) from: %s", lat, lon, target_cached)
                 return cached_data
         except Exception as e:
-            logger.warning("Corrupted raw Open-Meteo cache %s (%s). Re-fetching...", raw_file.name, e)
+            logger.warning("Corrupted raw Open-Meteo cache %s (%s). Re-fetching...", target_cached, e)
 
     model_cfg = SUPPORTED_HYBRID_MODELS[model_key]
     om_model = model_cfg["open_meteo_model"]
@@ -489,12 +500,21 @@ def fetch_open_meteo_single(
                 if isinstance(data, list):
                     data = data[0] if data else {}
 
-                # Save raw JSON checkpoint atomically
+                # Save raw JSON checkpoint atomically and flush to disk / Google Drive FUSE
                 tmp_file = raw_file.with_suffix(".tmp")
                 with open(tmp_file, "w", encoding="utf-8") as f:
                     json.dump(data, f)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
                 tmp_file.replace(raw_file)
-                logger.debug("Saved Open-Meteo raw JSON checkpoint: %s", raw_file.name)
+                try:
+                    os.sync()
+                except AttributeError:
+                    pass
+                logger.info("[Saved Raw Checkpoint] Saved Open-Meteo JSON for (%.4f, %.4f) to: %s", lat, lon, raw_file)
                 return data
 
             elif resp.status_code == 429:
