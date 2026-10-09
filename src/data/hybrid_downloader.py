@@ -905,6 +905,7 @@ def run_hybrid_batch(
     Executes batch download across a date range:
     - GFS: directly from AWS S3 (noaa-gfs-bdp-pds) with raw lead checkpoints to allow resuming
     - ECMWF IFS / JMA GSM: strictly 1 call per single location from Open-Meteo with raw JSON checkpointing
+    Tracks overall progress percentage, per-NWP-model breakdown, and records skipped cached files.
     """
     cycles = cycles or DEFAULT_CYCLES
     out_dir = Path(output_dir) if output_dir else DEFAULT_OUT_NWP_DIR
@@ -914,16 +915,74 @@ def run_hybrid_batch(
     end_dt = pd.to_datetime(end_date)
     date_list = pd.date_range(start_dt, end_dt, freq="D").strftime("%Y-%m-%d").tolist()
 
-    saved_files = []
+    validated_models = [resolve_model_key(m) for m in models]
+    cycles_per_model = len(date_list) * len(cycles)
+    total_cycles_all_models = len(validated_models) * cycles_per_model
 
-    for raw_m in models:
-        model_key = resolve_model_key(raw_m)
-        logger.info("=== Running Hybrid Batch for [%s] (%s to %s, %d locations) ===",
-                    model_key.upper(), start_date, end_date, len(coords))
+    overall_done = 0
+    overall_downloaded = 0
+    overall_skipped = 0
+
+    model_totals = {m: cycles_per_model for m in validated_models}
+    model_done = {m: 0 for m in validated_models}
+    model_downloaded = {m: 0 for m in validated_models}
+    model_skipped = {m: 0 for m in validated_models}
+
+    skipped_files: List[Dict[str, Any]] = []
+    downloaded_files: List[Dict[str, Any]] = []
+    saved_files: List[Path] = []
+
+    logger.info("Initiating Hybrid NWP Acquisition: %d total cycle(s) across %d model(s) (%s to %s, %d locations)",
+                total_cycles_all_models, len(validated_models), start_date, end_date, len(coords))
+    for m in validated_models:
+        logger.info("  * NWP Model Target: [%s] -> %d cycle(s)", m.upper(), cycles_per_model)
+
+    for model_key in validated_models:
+        model_out_dir = out_dir / model_key
+        model_out_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("=== Processing Hybrid Batch for [%s] (%s to %s) ===",
+                    model_key.upper(), start_date, end_date)
 
         if model_key == "gfs" and gfs_source.lower() == "aws":
             for date_s in date_list:
                 for cycle_s in cycles:
+                    cycle_clean = cycle_s.replace(":", "")[:2]
+                    target_file = model_out_dir / f"run_{date_s.replace('-', '')}_{cycle_clean}z.parquet"
+
+                    if target_file.exists():
+                        overall_done += 1
+                        overall_skipped += 1
+                        model_done[model_key] += 1
+                        model_skipped[model_key] += 1
+                        skipped_files.append({
+                            "path": target_file,
+                            "name": target_file.name,
+                            "model": model_key,
+                            "date": date_s,
+                            "cycle": cycle_s,
+                        })
+                        if target_file not in saved_files:
+                            saved_files.append(target_file)
+
+                        overall_pct = (overall_done / total_cycles_all_models) * 100
+                        m_pct = (model_done[model_key] / model_totals[model_key]) * 100
+                        logger.info(
+                            "[Progress: %d/%d (%.1f%%) | %s: %d/%d (%.1f%%)] [SKIP CACHED] Skipped existing cycle: %s",
+                            overall_done, total_cycles_all_models, overall_pct,
+                            model_key.upper(), model_done[model_key], model_totals[model_key], m_pct,
+                            target_file.name
+                        )
+                        continue
+
+                    # Download single GFS cycle
+                    overall_pct_start = ((overall_done + 1) / total_cycles_all_models) * 100
+                    m_pct_start = ((model_done[model_key] + 1) / model_totals[model_key]) * 100
+                    logger.info(
+                        "[Progress: %d/%d (%.1f%%) | %s: %d/%d (%.1f%%)] [DOWNLOADING] Fetching GFS cycle %s %s...",
+                        overall_done + 1, total_cycles_all_models, overall_pct_start,
+                        model_key.upper(), model_done[model_key] + 1, model_totals[model_key], m_pct_start,
+                        date_s, cycle_s
+                    )
                     try:
                         f = download_hybrid_cycle(
                             model=model_key,
@@ -938,32 +997,128 @@ def run_hybrid_batch(
                             gfs_source=gfs_source,
                             delay_between_calls=delay_between_calls,
                         )
-                        if f and f.exists() and f not in saved_files:
-                            saved_files.append(f)
+                        if f and f.exists():
+                            overall_done += 1
+                            overall_downloaded += 1
+                            model_done[model_key] += 1
+                            model_downloaded[model_key] += 1
+                            downloaded_files.append({
+                                "path": f,
+                                "name": f.name,
+                                "model": model_key,
+                                "date": date_s,
+                                "cycle": cycle_s,
+                            })
+                            if f not in saved_files:
+                                saved_files.append(f)
                     except Exception as exc:
                         logger.error("Failed cycle %s %s for %s: %s", date_s, cycle_s, model_key, exc)
         else:
-            # Open-Meteo models (ECMWF IFS, JMA GSM, or fallback GFS):
-            # Query strictly 1 call per single location for the requested date window with raw JSON caching
-            try:
-                om_files = download_open_meteo_date_range(
-                    model_key=model_key,
-                    start_date=start_date,
-                    end_date=end_date,
-                    cycles=cycles,
-                    coords=coords,
-                    output_dir=out_dir,
-                    raw_dir=raw_dir,
-                    max_lead_hours=max_lead_hours,
-                    delay_between_calls=delay_between_calls,
-                )
-                for f in om_files:
-                    if f and f.exists() and f not in saved_files:
-                        saved_files.append(f)
-            except Exception as exc:
-                logger.error("Failed Open-Meteo date range download for %s: %s", model_key, exc)
+            # Open-Meteo models (ECMWF IFS, JMA GSM, or fallback GFS)
+            # Pre-scan existing files to detect skipped vs needed
+            needed_cycles = []
+            for date_s in date_list:
+                for cycle_s in cycles:
+                    cycle_clean = cycle_s.replace(":", "")[:2]
+                    target_file = model_out_dir / f"run_{date_s.replace('-', '')}_{cycle_clean}z.parquet"
 
-    logger.info("Hybrid acquisition complete. Saved %d cycle file(s).", len(saved_files))
+                    if target_file.exists():
+                        overall_done += 1
+                        overall_skipped += 1
+                        model_done[model_key] += 1
+                        model_skipped[model_key] += 1
+                        skipped_files.append({
+                            "path": target_file,
+                            "name": target_file.name,
+                            "model": model_key,
+                            "date": date_s,
+                            "cycle": cycle_s,
+                        })
+                        if target_file not in saved_files:
+                            saved_files.append(target_file)
+
+                        overall_pct = (overall_done / total_cycles_all_models) * 100
+                        m_pct = (model_done[model_key] / model_totals[model_key]) * 100
+                        logger.info(
+                            "[Progress: %d/%d (%.1f%%) | %s: %d/%d (%.1f%%)] [SKIP CACHED] Skipped existing cycle: %s",
+                            overall_done, total_cycles_all_models, overall_pct,
+                            model_key.upper(), model_done[model_key], model_totals[model_key], m_pct,
+                            target_file.name
+                        )
+                    else:
+                        needed_cycles.append((date_s, cycle_s, target_file))
+
+            if needed_cycles:
+                logger.info(
+                    "[%s] Downloading %d missing cycle(s) via Open-Meteo across %d locations...",
+                    model_key.upper(), len(needed_cycles), len(coords)
+                )
+                try:
+                    om_files = download_open_meteo_date_range(
+                        model_key=model_key,
+                        start_date=start_date,
+                        end_date=end_date,
+                        cycles=cycles,
+                        coords=coords,
+                        output_dir=out_dir,
+                        raw_dir=raw_dir,
+                        max_lead_hours=max_lead_hours,
+                        delay_between_calls=delay_between_calls,
+                    )
+                    for f in om_files:
+                        if f and f.exists() and f not in saved_files:
+                            saved_files.append(f)
+                            overall_done += 1
+                            overall_downloaded += 1
+                            model_done[model_key] += 1
+                            model_downloaded[model_key] += 1
+                            downloaded_files.append({
+                                "path": f,
+                                "name": f.name,
+                                "model": model_key,
+                                "date": "",
+                                "cycle": "",
+                            })
+                except Exception as exc:
+                    logger.error("Failed Open-Meteo date range download for %s: %s", model_key, exc)
+
+    # Detailed Acquisition Summary Report Banner
+    overall_completion_pct = (overall_done / total_cycles_all_models * 100) if total_cycles_all_models else 0.0
+    dl_pct = (overall_downloaded / total_cycles_all_models * 100) if total_cycles_all_models else 0.0
+    sk_pct = (overall_skipped / total_cycles_all_models * 100) if total_cycles_all_models else 0.0
+
+    logger.info("================================================================================")
+    logger.info("                         HYBRID NWP ACQUISITION SUMMARY                         ")
+    logger.info("================================================================================")
+    logger.info("Total Forecast Cycles Requested : %d", total_cycles_all_models)
+    logger.info("Overall Completion Rate         : %.1f%% (%d/%d cycles processed)", overall_completion_pct, overall_done, total_cycles_all_models)
+    logger.info("  - Downloaded / Generated      : %d (%.1f%%)", overall_downloaded, dl_pct)
+    logger.info("  - Skipped (Already Cached)    : %d (%.1f%%)", overall_skipped, sk_pct)
+    logger.info("--------------------------------------------------------------------------------")
+    logger.info("Breakdown by NWP Model:")
+    for m, m_tot in model_totals.items():
+        m_d = model_done[m]
+        m_dl = model_downloaded[m]
+        m_sk = model_skipped[m]
+        m_pct = (m_d / m_tot * 100) if m_tot else 0.0
+        logger.info(
+            "  * [%s]: %d/%d (%.1f%%) | Downloaded: %d | Skipped: %d",
+            m.upper(), m_d, m_tot, m_pct, m_dl, m_sk
+        )
+    logger.info("--------------------------------------------------------------------------------")
+    if skipped_files:
+        logger.info("Skipped Files List (%d files):", len(skipped_files))
+        max_display = 25
+        for item in skipped_files[:max_display]:
+            cycle_info = f" | {item['date']} {item['cycle']}" if item.get('date') else ""
+            logger.info("  [SKIPPED] %s (Model: %s%s)", item["name"], item["model"].upper(), cycle_info)
+        if len(skipped_files) > max_display:
+            logger.info("  ... and %d more cached files skipped (total skipped: %d)",
+                        len(skipped_files) - max_display, len(skipped_files))
+    else:
+        logger.info("No files were skipped (all cycles were newly downloaded/generated).")
+    logger.info("================================================================================")
+
     return saved_files
 
 

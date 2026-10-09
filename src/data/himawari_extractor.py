@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import argparse
 import logging
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union, Any
 import datetime
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*invalid value encountered in log.*")
@@ -36,12 +36,25 @@ from src.data.himawari_aws_downloader import (
     fetch_himawari_observation_aws,
     fetch_himawari_convective_bundle_aws,
     check_coverage_across_years,
+    get_himawari_bucket_and_sat,
+    HIMAWARI_CUTOVER_UTC,
 )
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 DEFAULT_HIMAWARI_OUT = DEFAULT_HIMAWARI_DIR
+
+
+def get_satellite_model_name(dt: pd.Timestamp) -> str:
+    """Returns human-readable satellite model name: Himawari-8 (H08) or Himawari-9 (H09)."""
+    try:
+        _, sat_code = get_himawari_bucket_and_sat(dt)
+        return "Himawari-8 (H08)" if sat_code == "H08" else "Himawari-9 (H09)"
+    except Exception:
+        ts = dt.tz_localize("UTC") if dt.tzinfo is None else dt.tz_convert("UTC")
+        return "Himawari-8 (H08)" if ts < HIMAWARI_CUTOVER_UTC else "Himawari-9 (H09)"
+
 
 # Thailand Spatial Coordinates Grid (Sample points for dev resolution)
 GRID_LATS = np.arange(5.5, 21.0, 0.5)
@@ -220,12 +233,17 @@ def run_himawari_acquisition(
     days: Optional[int] = None,
     step_hours: int = 1,
     cycles: Optional[List[int]] = None,
+    models: Optional[Union[str, List[str]]] = None,
     source: str = "aws_s3",
     max_workers: int = 5,
     overwrite: bool = False,
     out_dir: Path = DEFAULT_HIMAWARI_OUT
 ) -> List[Path]:
-    """Generates and archives Himawari cloud features across timestamps."""
+    """
+    Generates and archives Himawari cloud features across timestamps.
+    Tracks overall progress percentage, per-satellite-model breakdown (Himawari-8 vs Himawari-9),
+    and records which files were skipped/cached versus newly downloaded/extracted.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine target timestamps
@@ -247,34 +265,147 @@ def run_himawari_acquisition(
         hours = sample_hours if sample_hours is not None else 6
         timestamps = [start_dt + pd.Timedelta(hours=i * step_hours) for i in range(hours)]
 
+    # Filter timestamps by satellite model if requested
+    if models is not None:
+        if isinstance(models, str):
+            selected_models = [m.strip().lower() for m in models.split(",")]
+        else:
+            selected_models = [str(m).strip().lower() for m in models]
+
+        if "all" not in selected_models:
+            filtered_ts = []
+            for ts in timestamps:
+                m_name = get_satellite_model_name(ts).lower()
+                # Matches 'himawari-8', 'himawari8', 'h08', etc.
+                match = any(
+                    (s in m_name) or
+                    (s in ["h08", "himawari8", "himawari-8"] and "himawari-8" in m_name) or
+                    (s in ["h09", "himawari9", "himawari-9"] and "himawari-9" in m_name)
+                    for s in selected_models
+                )
+                if match:
+                    filtered_ts.append(ts)
+            timestamps = filtered_ts
+
     if not timestamps:
-        logger.warning("No timestamps generated for the given range.")
+        logger.warning("No timestamps generated for the given range / models filter.")
         return []
 
-    total_tasks = len(timestamps)
-    logger.info("Processing Himawari features (%s): %d snapshot(s) from %s to %s (step: %dh)...",
-                source, total_tasks, timestamps[0], timestamps[-1], step_hours)
+    # Map timestamps to satellite models and calculate task totals
+    model_mapping = {ts: get_satellite_model_name(ts) for ts in timestamps}
+    model_totals: Dict[str, int] = {}
+    for m in model_mapping.values():
+        model_totals[m] = model_totals.get(m, 0) + 1
 
-    saved_files = []
+    total_tasks = len(timestamps)
+    overall_done = 0
+    overall_downloaded = 0
+    overall_skipped = 0
+
+    model_done: Dict[str, int] = {m: 0 for m in model_totals}
+    model_downloaded: Dict[str, int] = {m: 0 for m in model_totals}
+    model_skipped: Dict[str, int] = {m: 0 for m in model_totals}
+
+    skipped_files: List[Dict[str, Any]] = []
+    downloaded_files: List[Dict[str, Any]] = []
+    saved_files: List[Path] = []
+
+    logger.info(
+        "Initiating Himawari Acquisition: %d snapshot(s) from %s to %s (step: %dh, source: %s)",
+        total_tasks, timestamps[0], timestamps[-1], step_hours, source
+    )
+    for m, m_tot in model_totals.items():
+        logger.info("  * Model Target: [%s] -> %d snapshot(s)", m, m_tot)
+
     for i, current_dt in enumerate(timestamps, start=1):
-        pct = (i / total_tasks) * 100
+        sat_model = model_mapping[current_dt]
         target_p = get_himawari_partition_path(current_dt, out_base_dir=out_dir)
 
+        # Check if already processed and skip if caching is active
         if target_p.exists() and not overwrite:
+            overall_done += 1
+            overall_skipped += 1
+            model_done[sat_model] += 1
+            model_skipped[sat_model] += 1
             saved_files.append(target_p)
-            if i % 100 == 1 or i == total_tasks or total_tasks <= 24:
-                logger.info("[Satellite Progress: %d/%d (%.1f%%)] [Cached] Found %s for %s",
-                            i, total_tasks, pct, target_p.name, current_dt)
+            skipped_files.append({
+                "path": target_p,
+                "name": target_p.name,
+                "timestamp": current_dt,
+                "model": sat_model,
+            })
+
+            overall_pct = (overall_done / total_tasks) * 100
+            m_pct = (model_done[sat_model] / model_totals[sat_model]) * 100
+            logger.info(
+                "[Progress: %d/%d (%.1f%%) | %s: %d/%d (%.1f%%)] [SKIP CACHED] Skipped already-existing file: %s (snapshot: %s)",
+                overall_done, total_tasks, overall_pct,
+                sat_model, model_done[sat_model], model_totals[sat_model], m_pct,
+                target_p.name, current_dt
+            )
             continue
 
-        if i % 10 == 1 or i == total_tasks or total_tasks <= 24:
-            logger.info("[Satellite Progress: %d/%d (%.1f%%)] Extracting Himawari snapshot for %s (%s, workers=%d)...",
-                        i, total_tasks, pct, current_dt, source, max_workers)
+        # Extract / Download snapshot
+        overall_pct_start = ((overall_done + 1) / total_tasks) * 100
+        m_pct_start = ((model_done[sat_model] + 1) / model_totals[sat_model]) * 100
+        logger.info(
+            "[Progress: %d/%d (%.1f%%) | %s: %d/%d (%.1f%%)] [EXTRACTING] Snapshot for %s (%s, workers=%d)...",
+            overall_done + 1, total_tasks, overall_pct_start,
+            sat_model, model_done[sat_model] + 1, model_totals[sat_model], m_pct_start,
+            current_dt, source, max_workers
+        )
+
         df_features = extract_convective_evolution_features(current_dt, source=source, max_workers=max_workers)
         p = save_himawari_partition(df_features, current_dt, out_base_dir=out_dir)
+
+        overall_done += 1
+        overall_downloaded += 1
+        model_done[sat_model] += 1
+        model_downloaded[sat_model] += 1
+        downloaded_files.append({
+            "path": p,
+            "name": p.name,
+            "timestamp": current_dt,
+            "model": sat_model,
+        })
         saved_files.append(p)
 
-    logger.info("Himawari acquisition finished: %d snapshot partitions ready at %s", len(saved_files), out_dir)
+    # Detailed Acquisition Summary Report Banner
+    overall_completion_pct = (overall_done / total_tasks * 100) if total_tasks else 0.0
+    dl_pct = (overall_downloaded / total_tasks * 100) if total_tasks else 0.0
+    sk_pct = (overall_skipped / total_tasks * 100) if total_tasks else 0.0
+
+    logger.info("================================================================================")
+    logger.info("                         HIMAWARI ACQUISITION SUMMARY                           ")
+    logger.info("================================================================================")
+    logger.info("Total Snapshots Requested : %d", total_tasks)
+    logger.info("Overall Completion Rate   : %.1f%% (%d/%d processed)", overall_completion_pct, overall_done, total_tasks)
+    logger.info("  - Downloaded / Extracted: %d (%.1f%%)", overall_downloaded, dl_pct)
+    logger.info("  - Skipped (Already Cached): %d (%.1f%%)", overall_skipped, sk_pct)
+    logger.info("--------------------------------------------------------------------------------")
+    logger.info("Breakdown by Satellite Model:")
+    for m, m_tot in model_totals.items():
+        m_d = model_done[m]
+        m_dl = model_downloaded[m]
+        m_sk = model_skipped[m]
+        m_pct = (m_d / m_tot * 100) if m_tot else 0.0
+        logger.info(
+            "  * [%s]: %d/%d (%.1f%%) | Downloaded: %d | Skipped: %d",
+            m, m_d, m_tot, m_pct, m_dl, m_sk
+        )
+    logger.info("--------------------------------------------------------------------------------")
+    if skipped_files:
+        logger.info("Skipped Files List (%d files):", len(skipped_files))
+        max_display = 25
+        for item in skipped_files[:max_display]:
+            logger.info("  [SKIPPED] %s (Model: %s | Snapshot: %s)", item["name"], item["model"], item["timestamp"])
+        if len(skipped_files) > max_display:
+            logger.info("  ... and %d more cached files skipped (total skipped: %d)",
+                        len(skipped_files) - max_display, len(skipped_files))
+    else:
+        logger.info("No files were skipped (all snapshots were newly downloaded/extracted).")
+    logger.info("================================================================================")
+
     return saved_files
 
 
@@ -290,6 +421,7 @@ def main():
     parser.add_argument("--sample-hours", "--hours", dest="sample_hours", type=int, default=None, help="Hours to process in dev mode (default: 6)")
     parser.add_argument("--step-hours", type=int, default=None, help="Step hours between snapshots (default: 6 for multi-day, 1 for sample-hours)")
     parser.add_argument("--cycles", type=str, default=None, help="Comma-separated cycle hours (e.g. '00,06,12,18' or '00,12')")
+    parser.add_argument("--models", "--satellites", dest="models", type=str, default=None, help="Satellite model filter: 'himawari8', 'himawari9', or 'all' (default: all)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing cached partitions")
     parser.add_argument("--full", action="store_true", help="Server production full mode (2021-01-01 to 2024-12-31)")
     parser.add_argument("--max-workers", "--workers", dest="max_workers", type=int, default=5, help="Number of concurrent worker threads for downloading (default: 5)")
@@ -337,6 +469,7 @@ def main():
         days=args.days,
         step_hours=step_h,
         cycles=cycles_list,
+        models=args.models,
         source=args.source,
         max_workers=args.max_workers,
         overwrite=args.overwrite,
