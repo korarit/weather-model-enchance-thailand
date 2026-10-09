@@ -53,6 +53,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 OPEN_METEO_HISTORICAL_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 NOAA_GFS_S3_BUCKET = "noaa-gfs-bdp-pds"
 
+# Rate Limiting & Pacing Configuration for Open-Meteo
+# Open-Meteo free tier imposes a 600 calls/min (10 calls/s) limit and 5000 calls/hr.
+# Default delay of 0.25s (~4 calls/s = 240 calls/min) stays well within limits.
+DEFAULT_DELAY_BETWEEN_CALLS = float(os.getenv("OPEN_METEO_DELAY", "0.25"))
+
+_GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL = 0.0
+_CURRENT_ADAPTIVE_DELAY = DEFAULT_DELAY_BETWEEN_CALLS
+
 # Supported models
 SUPPORTED_HYBRID_MODELS = {
     "ecmwf_ifs": {
@@ -408,13 +416,16 @@ def fetch_open_meteo_single(
     start_date: str,
     end_date: str,
     raw_dir: Optional[Path] = None,
-    max_retries: int = 3,
-    retry_delay: float = 2.0,
+    max_retries: int = 5,
+    retry_delay: float = 5.0,
 ) -> Dict[str, Any]:
     """
     Fetches historical forecast time series from Open-Meteo for a single location (1 API call = 1 coordinate).
     Persists raw responses as JSON files to allow resuming if stopped midway.
+    Handles HTTP 429 (Rate Limits) with Retry-After inspection, global cooldown, and exponential backoff.
     """
+    global _GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL, _CURRENT_ADAPTIVE_DELAY
+
     raw_base = Path(raw_dir) if raw_dir else DEFAULT_RAW_NWP_DIR
     raw_om_dir = raw_base / "openmeteo" / model_key
     raw_om_dir.mkdir(parents=True, exist_ok=True)
@@ -461,6 +472,16 @@ def fetch_open_meteo_single(
 
     last_error = None
     for attempt in range(1, max_retries + 1):
+        # Enforce global cooldown if an earlier request hit a rate limit
+        now = time.time()
+        if _GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL > now:
+            pause_time = _GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL - now
+            logger.info(
+                "Global rate-limit cooldown active. Pausing for %.1fs before querying (%.4f, %.4f)...",
+                pause_time, lat, lon
+            )
+            time.sleep(pause_time)
+
         try:
             resp = requests.get(OPEN_METEO_HISTORICAL_URL, params=params, headers=headers, timeout=60)
             if resp.status_code == 200:
@@ -475,17 +496,86 @@ def fetch_open_meteo_single(
                 tmp_file.replace(raw_file)
                 logger.debug("Saved Open-Meteo raw JSON checkpoint: %s", raw_file.name)
                 return data
-            elif resp.status_code in (429, 500, 502, 503, 504):
-                logger.warning("Open-Meteo HTTP %d for (%.4f, %.4f) on attempt %d/%d. Waiting %.1fs...",
-                               resp.status_code, lat, lon, attempt, max_retries, retry_delay)
-                time.sleep(retry_delay * attempt)
+
+            elif resp.status_code == 429:
+                # Parse rate limit reason and retry duration
+                err_text = resp.text.strip()
+                err_reason = ""
+                try:
+                    err_json = resp.json()
+                    if isinstance(err_json, dict):
+                        err_reason = err_json.get("reason", "")
+                except Exception:
+                    pass
+                reason_str = err_reason or err_text[:200]
+                last_error = f"HTTP 429: {reason_str}"
+
+                # Check Retry-After header
+                wait_sec = None
+                retry_after_hdr = resp.headers.get("Retry-After")
+                if retry_after_hdr:
+                    try:
+                        wait_sec = float(retry_after_hdr) + 1.0
+                    except (ValueError, TypeError):
+                        pass
+
+                if wait_sec is None:
+                    lower_msg = reason_str.lower()
+                    if "minute" in lower_msg:
+                        # Minutely quota reset: wait full 60s
+                        wait_sec = max(60.0, retry_delay * (2 ** (attempt - 1)))
+                    elif "hour" in lower_msg:
+                        logger.error(
+                            "Open-Meteo Hourly Limit Exceeded (5,000 calls): %s. "
+                            "Please wait for the next hour window.",
+                            reason_str
+                        )
+                        wait_sec = max(60.0, retry_delay * (2 ** (attempt - 1)))
+                    elif "daily" in lower_msg or "day" in lower_msg:
+                        logger.error(
+                            "Open-Meteo Daily Limit Exceeded (10,000 calls): %s. "
+                            "Please wait for daily quota to reset.",
+                            reason_str
+                        )
+                        wait_sec = max(60.0, retry_delay * (2 ** (attempt - 1)))
+                    else:
+                        # Exponential backoff for 429: 15s, 30s, 60s, 90s, 120s
+                        wait_sec = max(15.0, retry_delay * (2 ** (attempt - 1)))
+
+                # Enforce global cooldown so subsequent requests don't collide
+                _GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL = max(_GLOBAL_RATE_LIMIT_COOLDOWN_UNTIL, time.time() + wait_sec)
+                # Dynamically increase baseline session delay to prevent immediate rate limit re-triggers
+                _CURRENT_ADAPTIVE_DELAY = max(_CURRENT_ADAPTIVE_DELAY, 0.5)
+
+                logger.warning(
+                    "Open-Meteo HTTP 429 (Rate Limited) for (%.4f, %.4f) on attempt %d/%d. "
+                    "Reason: '%s'. Backoff waiting %.1fs (session delay increased to %.2fs)...",
+                    lat, lon, attempt, max_retries, reason_str, wait_sec, _CURRENT_ADAPTIVE_DELAY
+                )
+                time.sleep(wait_sec)
+
+            elif resp.status_code in (500, 502, 503, 504):
+                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                wait_sec = retry_delay * attempt
+                logger.warning(
+                    "Open-Meteo HTTP %d for (%.4f, %.4f) on attempt %d/%d. Retrying in %.1fs...",
+                    resp.status_code, lat, lon, attempt, max_retries, wait_sec
+                )
+                time.sleep(wait_sec)
+
             else:
+                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
                 resp.raise_for_status()
+
         except Exception as exc:
-            last_error = exc
-            logger.warning("Open-Meteo request error for (%.4f, %.4f) on attempt %d/%d: %s. Retrying in %.1fs...",
-                           lat, lon, attempt, max_retries, exc, retry_delay)
-            time.sleep(retry_delay * attempt)
+            if not last_error or not str(last_error).startswith("HTTP"):
+                last_error = exc
+            wait_sec = retry_delay * attempt
+            logger.warning(
+                "Open-Meteo request error for (%.4f, %.4f) on attempt %d/%d: %s. Retrying in %.1fs...",
+                lat, lon, attempt, max_retries, exc, wait_sec
+            )
+            time.sleep(wait_sec)
 
     raise RuntimeError(f"Failed to fetch data from Open-Meteo for ({lat:.4f}, {lon:.4f}) after {max_retries} attempts: {last_error}")
 
@@ -575,7 +665,7 @@ def download_open_meteo_cycle(
     coords: List[Tuple[float, float]],
     raw_dir: Optional[Path] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
-    delay_between_calls: float = 0.1,
+    delay_between_calls: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     Downloads and maps a single forecast cycle from Open-Meteo.
@@ -590,9 +680,10 @@ def download_open_meteo_cycle(
 
     target_run_time = pd.Timestamp(f"{date_str} {cycle_str}")
     all_dfs = []
+    actual_delay = delay_between_calls if delay_between_calls is not None else DEFAULT_DELAY_BETWEEN_CALLS
 
-    logger.info("Fetching [%s] via Open-Meteo for cycle %s %s (1 call per location, total %d locations)...",
-                model_key.upper(), date_str, cycle_str, len(coords))
+    logger.info("Fetching [%s] via Open-Meteo for cycle %s %s (1 call per location, total %d locations, pacing %.2fs)...",
+                model_key.upper(), date_str, cycle_str, len(coords), actual_delay)
 
     for idx, (lat, lon) in enumerate(coords, start=1):
         try:
@@ -620,8 +711,9 @@ def download_open_meteo_cycle(
             logger.warning("Failed Open-Meteo fetch for location (%.4f, %.4f) on %s %s: %s",
                            lat, lon, date_str, cycle_str, exc)
 
-        if delay_between_calls > 0 and idx < len(coords):
-            time.sleep(delay_between_calls)
+        current_delay = max(actual_delay, _CURRENT_ADAPTIVE_DELAY)
+        if current_delay > 0 and idx < len(coords):
+            time.sleep(current_delay)
 
     if not all_dfs:
         raise RuntimeError(f"No records retrieved from Open-Meteo for {model_key} on {date_str} {cycle_str}")
@@ -638,7 +730,7 @@ def download_open_meteo_date_range(
     output_dir: Path,
     raw_dir: Optional[Path] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
-    delay_between_calls: float = 0.1,
+    delay_between_calls: Optional[float] = None,
 ) -> List[Path]:
     """
     Downloads and maps Open-Meteo forecasts across a date range.
@@ -674,8 +766,9 @@ def download_open_meteo_date_range(
             for d_str in date_list for c_str in cycles
         ]
 
-    logger.info("Ingesting [%s] via Open-Meteo (1 call per location, %d location(s), %s to %s)...",
-                model_key.upper(), len(coords), start_str, end_date)
+    actual_delay = delay_between_calls if delay_between_calls is not None else DEFAULT_DELAY_BETWEEN_CALLS
+    logger.info("Ingesting [%s] via Open-Meteo (1 call per location, %d location(s), %s to %s, pacing %.2fs)...",
+                model_key.upper(), len(coords), start_str, end_date, actual_delay)
 
     location_dfs = []
     for idx, (lat, lon) in enumerate(coords, start=1):
@@ -701,8 +794,9 @@ def download_open_meteo_date_range(
         except Exception as exc:
             logger.warning("Failed Open-Meteo fetch for location (%.4f, %.4f): %s", lat, lon, exc)
 
-        if delay_between_calls > 0 and idx < len(coords):
-            time.sleep(delay_between_calls)
+        current_delay = max(actual_delay, _CURRENT_ADAPTIVE_DELAY)
+        if current_delay > 0 and idx < len(coords):
+            time.sleep(current_delay)
 
     if not location_dfs:
         raise RuntimeError(f"Failed to fetch Open-Meteo data for any locations for {model_key}")
@@ -742,6 +836,7 @@ def download_hybrid_cycle(
     stations_limit: Optional[int] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
     gfs_source: str = "aws",
+    delay_between_calls: Optional[float] = None,
 ) -> Path:
     """
     Downloads and maps a single forecast cycle for the specified model:
@@ -784,6 +879,7 @@ def download_hybrid_cycle(
             coords=coords,
             raw_dir=raw_dir,
             max_lead_hours=max_lead_hours,
+            delay_between_calls=delay_between_calls,
         )
 
     df_result.to_parquet(out_file, index=False, compression="snappy")
@@ -803,6 +899,7 @@ def run_hybrid_batch(
     stations_limit: Optional[int] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
     gfs_source: str = "aws",
+    delay_between_calls: Optional[float] = None,
 ) -> List[Path]:
     """
     Executes batch download across a date range:
@@ -839,6 +936,7 @@ def run_hybrid_batch(
                             stations_limit=stations_limit,
                             max_lead_hours=max_lead_hours,
                             gfs_source=gfs_source,
+                            delay_between_calls=delay_between_calls,
                         )
                         if f and f.exists() and f not in saved_files:
                             saved_files.append(f)
@@ -857,6 +955,7 @@ def run_hybrid_batch(
                     output_dir=out_dir,
                     raw_dir=raw_dir,
                     max_lead_hours=max_lead_hours,
+                    delay_between_calls=delay_between_calls,
                 )
                 for f in om_files:
                     if f and f.exists() and f not in saved_files:
@@ -916,6 +1015,13 @@ def main():
     )
     parser.add_argument("--cycles", nargs="+", default=DEFAULT_CYCLES, help="Forecast cycles (e.g. 00:00 12:00)")
     parser.add_argument("--max-lead", type=int, default=DEFAULT_MAX_LEAD, help="Max lead time hours (default: 24)")
+    parser.add_argument(
+        "--delay", "--delay-between-calls",
+        dest="delay_between_calls",
+        type=float,
+        default=None,
+        help="Delay in seconds between Open-Meteo API requests (default: 0.25s)",
+    )
     parser.add_argument("--out-dir", type=str, default=str(DEFAULT_OUT_NWP_DIR), help="Output directory for processed parquet cycles")
     parser.add_argument("--raw-dir", type=str, default=str(DEFAULT_RAW_NWP_DIR), help="Output directory for raw checkpoints (JSON for Open-Meteo, JSON lead checkpoints for GFS)")
     parser.add_argument("--meta-dir", type=str, default=str(DEFAULT_HII_META_DIR), help="HII metadata directory")
@@ -966,6 +1072,7 @@ def main():
         stations_limit=stn_limit,
         max_lead_hours=args.max_lead,
         gfs_source=args.gfs_source,
+        delay_between_calls=args.delay_between_calls,
     )
 
 

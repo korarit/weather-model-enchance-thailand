@@ -114,12 +114,14 @@ def run_full_pipeline(
                 target_models = ["ecmwf_ifs"]
             else:
                 target_models = ["gfs"]
+            sample_stns = 5 if smoke_test else None
             run_hybrid_batch(
                 models=target_models,
                 start_date="2021-01-01",
                 end_date="2021-01-02" if smoke_test else "2021-01-05",
                 output_dir=forecast_paths["out_nwp_dir"],
                 meta_dir=hii_paths["meta_dir"],
+                stations_limit=sample_stns,
             )
         else:
             # Standard TIGGE flow
