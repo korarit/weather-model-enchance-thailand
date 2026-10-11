@@ -29,8 +29,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 import numpy as np
 import pandas as pd
+try:
+    pd.set_option('future.no_silent_downcasting', True)
+except Exception:
+    pass
 import requests
 
 import boto3
@@ -449,7 +456,7 @@ def fetch_open_meteo_single(
             with open(target_cached, "r", encoding="utf-8") as f:
                 cached_data = json.load(f)
             if isinstance(cached_data, dict) and "hourly" in cached_data and cached_data["hourly"].get("time"):
-                logger.info("[Cached Raw] Loaded Open-Meteo JSON for (%.4f, %.4f) from: %s", lat, lon, target_cached)
+                logger.debug("[Cached Raw] Loaded Open-Meteo JSON for (%.4f, %.4f) from: %s", lat, lon, target_cached)
                 return cached_data
         except Exception as e:
             logger.warning("Corrupted raw Open-Meteo cache %s (%s). Re-fetching...", target_cached, e)
@@ -514,7 +521,7 @@ def fetch_open_meteo_single(
                     os.sync()
                 except AttributeError:
                     pass
-                logger.info("[Saved Raw Checkpoint] Saved Open-Meteo JSON for (%.4f, %.4f) to: %s", lat, lon, raw_file)
+                logger.debug("[Saved Raw Checkpoint] Saved Open-Meteo JSON for (%.4f, %.4f) to: %s", lat, lon, raw_file)
                 return data
 
             elif resp.status_code == 429:
@@ -622,6 +629,9 @@ def map_rolling_window_to_cycles(
         return pd.DataFrame()
 
     df_raw["time"] = pd.to_datetime(df_raw["time"])
+    for col in df_raw.columns:
+        if col != "time":
+            df_raw[col] = pd.to_numeric(df_raw[col], errors="coerce")
 
     precip_col = None
     for c in ["precipitation", "rain", f"precipitation_{origin}", f"rain_{origin}"]:
@@ -675,12 +685,12 @@ def map_rolling_window_to_cycles(
 
     aligned_df = df_raw.reindex(valid_dt)
 
-    tp_vals = np.maximum(0.0, aligned_df[precip_col].fillna(0.0).values) if precip_col and precip_col in aligned_df else np.zeros(len(valid_dt))
-    sp_vals = np.clip(aligned_df[press_col].fillna(1010.0).values, 800.0, 1050.0) if press_col in aligned_df else np.full(len(valid_dt), 1010.0)
-    t2m_vals = np.clip(aligned_df[temp_col].fillna(25.0).values, -10.0, 50.0) if temp_col in aligned_df else np.full(len(valid_dt), 25.0)
-    ws_vals = aligned_df[ws_col].fillna(0.0).values if ws_col in aligned_df else np.zeros(len(valid_dt))
-    wd_vals = aligned_df[wd_col].fillna(0.0).values if wd_col in aligned_df else np.zeros(len(valid_dt))
-    cape_vals = np.maximum(0.0, aligned_df[cape_col].fillna(0.0).values) if cape_col in aligned_df else np.zeros(len(valid_dt))
+    tp_vals = np.maximum(0.0, pd.to_numeric(aligned_df[precip_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)) if precip_col and precip_col in aligned_df else np.zeros(len(valid_dt))
+    sp_vals = np.clip(pd.to_numeric(aligned_df[press_col], errors="coerce").fillna(1010.0).to_numpy(dtype=float), 800.0, 1050.0) if press_col in aligned_df else np.full(len(valid_dt), 1010.0)
+    t2m_vals = np.clip(pd.to_numeric(aligned_df[temp_col], errors="coerce").fillna(25.0).to_numpy(dtype=float), -10.0, 50.0) if temp_col in aligned_df else np.full(len(valid_dt), 25.0)
+    ws_vals = pd.to_numeric(aligned_df[ws_col], errors="coerce").fillna(0.0).to_numpy(dtype=float) if ws_col in aligned_df else np.zeros(len(valid_dt))
+    wd_vals = pd.to_numeric(aligned_df[wd_col], errors="coerce").fillna(0.0).to_numpy(dtype=float) if wd_col in aligned_df else np.zeros(len(valid_dt))
+    cape_vals = np.maximum(0.0, pd.to_numeric(aligned_df[cape_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)) if cape_col in aligned_df else np.zeros(len(valid_dt))
 
     u10_vals, v10_vals = compute_uv_components(ws_vals, wd_vals)
 
@@ -754,6 +764,10 @@ def download_open_meteo_cycle(
         except Exception as exc:
             logger.warning("Failed Open-Meteo fetch for location (%.4f, %.4f) on %s %s: %s",
                            lat, lon, date_str, cycle_str, exc)
+
+        if idx % 100 == 0 or idx == len(coords) or len(coords) <= 10:
+            logger.info("[%s Open-Meteo Progress: %d/%d (%.1f%%)] Processing location (%.4f, %.4f) for cycle %s %s",
+                        model_key.upper(), idx, len(coords), (idx / len(coords)) * 100.0, lat, lon, date_str, cycle_str)
 
         current_delay = max(actual_delay, _CURRENT_ADAPTIVE_DELAY)
         if current_delay > 0 and idx < len(coords):
