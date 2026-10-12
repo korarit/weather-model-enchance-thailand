@@ -125,8 +125,8 @@ def train_and_eval_lgbm(
 
 def main():
     parser = argparse.ArgumentParser(description="LightGBM Bias Correction Runner")
-    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "all"], default=None, help="Target Weather Model (or 'all')")
-    parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default=None, help="Feature ablation variant")
+    parser.add_argument("--weather-model", type=str, default=None, help="Target Weather Model (e.g. 'ecmwf_ifs', 'gfs', 'ecmwf_ifs,gfs', or 'all')")
+    parser.add_argument("--ablation", type=str, default=None, help="Feature ablation variant (e.g. 'm1', 'm2', 'm3', 'm1,m2', or 'all')")
     parser.add_argument("--smoke-test", action="store_true", help="Run rapid smoke test on PC (50-100 rows, 1-2 trees)")
     parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/lightgbm/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")

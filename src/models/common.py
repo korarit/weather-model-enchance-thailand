@@ -179,9 +179,56 @@ def get_train_val_split(
 
 
 SUPPORTED_WEATHER_MODELS = [
-    "ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access"
+    "ecmwf_ifs", "ncep_gfs", "gfs", "dwd_icon", "cmc_gem", "bom_access", "jma_gsm"
 ]
 
+WEATHER_MODEL_ALIASES = {
+    "gfs": "ncep_gfs",
+    "ncep": "ncep_gfs",
+    "kwbc": "ncep_gfs",
+    "ncep_gfs": "ncep_gfs",
+    "ecmwf": "ecmwf_ifs",
+    "ecmf": "ecmwf_ifs",
+    "ecmwf_ifs": "ecmwf_ifs",
+    "icon": "dwd_icon",
+    "dwd": "dwd_icon",
+    "dwd_icon": "dwd_icon",
+    "jma": "jma_gsm",
+    "jma_gsm": "jma_gsm",
+    "gem": "cmc_gem",
+    "cmc": "cmc_gem",
+    "cmc_gem": "cmc_gem",
+    "access": "bom_access",
+    "bom": "bom_access",
+    "bom_access": "bom_access",
+}
+
+
+def normalize_weather_model_name(name: str) -> str:
+    """Normalizes weather model names and aliases to canonical system names."""
+    clean = str(name).strip().lower()
+    return WEATHER_MODEL_ALIASES.get(clean, clean)
+
+
+def numpy_to_torch(arr: np.ndarray, dtype=None):
+    """Safely converts numpy array to torch tensor with fallback for mismatched numpy/torch builds."""
+    import torch
+    try:
+        t = torch.from_numpy(arr)
+        if dtype is not None:
+            t = t.to(dtype=dtype)
+        return t
+    except Exception:
+        t_dtype = dtype or (torch.float32 if arr.dtype in (np.float32, np.float64) else torch.int64)
+        return torch.tensor(arr.tolist(), dtype=t_dtype)
+
+
+def torch_to_numpy(tensor, dtype=np.float32) -> np.ndarray:
+    """Safely converts torch tensor to numpy array with fallback for mismatched numpy/torch builds."""
+    try:
+        return tensor.detach().cpu().numpy()
+    except Exception:
+        return np.array(tensor.detach().cpu().tolist(), dtype=dtype)
 
 
 def generate_smoke_test_dataset(
@@ -197,13 +244,15 @@ def generate_smoke_test_dataset(
     basins = ["Chao Phraya", "Chi", "Mun", "Yom", "Ping", "Nan", "Tha Chin", "Mae Klong"]
 
     # Model specific bias characteristics
+    canonical_wm = normalize_weather_model_name(weather_model)
     model_bias_offset = {
         "ecmwf_ifs": 0.35,
         "ncep_gfs": 0.55,
         "dwd_icon": 0.45,
         "cmc_gem": 0.60,
         "bom_access": 0.50,
-    }.get(weather_model, 0.4)
+        "jma_gsm": 0.40,
+    }.get(canonical_wm, 0.4)
 
     for i in range(n_samples):
         rt = np.random.choice(run_times)
@@ -522,23 +571,39 @@ def resolve_runner_execution_targets(
 
     # Resolve target weather models
     target_wm = weather_model_arg
-    if target_wm is None or (target_wm == "ecmwf_ifs" and "weather_model" in config_data):
-        target_wm = config_data.get("weather_model", "ecmwf_ifs")
+    if target_wm is None and "weather_model" in config_data:
+        target_wm = config_data.get("weather_model")
 
-    if target_wm == "all":
-        weather_models = ["ecmwf_ifs", "ncep_gfs", "dwd_icon"]
+    if target_wm is None or target_wm == "":
+        weather_models = ["ecmwf_ifs"]
+    elif isinstance(target_wm, str):
+        if target_wm.lower() == "all":
+            weather_models = ["ecmwf_ifs", "ncep_gfs", "dwd_icon"]
+        elif target_wm.lower() in ("hybrid", "hybrid_models"):
+            weather_models = ["ecmwf_ifs", "ncep_gfs"]
+        else:
+            weather_models = [normalize_weather_model_name(m) for m in target_wm.split(",") if m.strip()]
+    elif isinstance(target_wm, list):
+        weather_models = [normalize_weather_model_name(m) for m in target_wm]
     else:
-        weather_models = [target_wm]
+        weather_models = [normalize_weather_model_name(str(target_wm))]
 
     # Resolve target ablation variants
     target_ab = ablation_arg
-    if target_ab is None or (target_ab == "m3" and "ablation_variant" in config_data):
-        target_ab = config_data.get("ablation_variant", "m3")
+    if target_ab is None and "ablation_variant" in config_data:
+        target_ab = config_data.get("ablation_variant")
 
-    if target_ab == "all":
-        ablations = ["m1", "m2", "m3"]
+    if target_ab is None or target_ab == "":
+        ablations = ["m3"]
+    elif isinstance(target_ab, str):
+        if target_ab.lower() == "all":
+            ablations = ["m1", "m2", "m3"]
+        else:
+            ablations = [a.strip().lower() for a in target_ab.split(",") if a.strip()]
+    elif isinstance(target_ab, list):
+        ablations = [a.strip().lower() for a in target_ab]
     else:
-        ablations = [target_ab]
+        ablations = [str(target_ab).strip().lower()]
 
     hyperparams = config_data.get("hyperparameters", {})
     return weather_models, ablations, hyperparams
@@ -568,6 +633,8 @@ def load_training_dataset(
     """
     import gc
 
+    norm_wm = normalize_weather_model_name(weather_model or "ecmwf_ifs")
+
     if data_path_or_str:
         p = Path(data_path_or_str)
         if not p.is_absolute() and not p.exists() and (PROJECT_ROOT / p).exists():
@@ -575,9 +642,9 @@ def load_training_dataset(
 
         assert_no_dwr_leakage(str(p))
 
-        cache_key = f"{p.resolve()}_{max_samples}"
+        cache_key = f"{p.resolve()}_{norm_wm}_{max_samples}"
         if cache_key in _LOADED_DATASET_CACHE:
-            logger.info("Using cached in-memory dataset for %s (%d rows)", p.name, len(_LOADED_DATASET_CACHE[cache_key]))
+            logger.info("Using cached in-memory dataset for %s [%s] (%d rows)", p.name, norm_wm.upper(), len(_LOADED_DATASET_CACHE[cache_key]))
             return _LOADED_DATASET_CACHE[cache_key]
 
         # Purge older cached dataset to strictly prevent memory accumulation
@@ -696,6 +763,21 @@ def load_training_dataset(
 
         assert_valid_training_years(df)
         df = standardize_dataframe_columns(df, inplace=True)
+
+        # Multi-model dataset filtering: isolate rows matching target weather_model
+        if norm_wm and ("weather_model" in df.columns or "origin" in df.columns):
+            wm_col = "weather_model" if "weather_model" in df.columns else "origin"
+            accepted = {norm_wm, weather_model.lower()}
+            for a, c in WEATHER_MODEL_ALIASES.items():
+                if c == norm_wm:
+                    accepted.add(a)
+            mask = df[wm_col].astype(str).str.lower().isin(accepted)
+            if mask.any() and not mask.all():
+                n_before = len(df)
+                df = df[mask].reset_index(drop=True)
+                logger.info("[Weather Model Filter] Filtered dataset for [%s]: %d -> %d rows",
+                            norm_wm.upper(), n_before, len(df))
+
         logger.info("Loaded training dataset: %d rows x %d columns (RAM: %.2f MB)",
                     len(df), len(df.columns), df.memory_usage().sum() / (1024 * 1024))
         _LOADED_DATASET_CACHE[cache_key] = df
@@ -734,12 +816,27 @@ def load_training_dataset(
                 df = df.iloc[:max_samples].reset_index(drop=True)
             assert_valid_training_years(df)
             df = standardize_dataframe_columns(df, inplace=True)
+
+            # Multi-model dataset filtering
+            if norm_wm and ("weather_model" in df.columns or "origin" in df.columns):
+                wm_col = "weather_model" if "weather_model" in df.columns else "origin"
+                accepted = {norm_wm, weather_model.lower()}
+                for a, c in WEATHER_MODEL_ALIASES.items():
+                    if c == norm_wm:
+                        accepted.add(a)
+                mask = df[wm_col].astype(str).str.lower().isin(accepted)
+                if mask.any() and not mask.all():
+                    n_before = len(df)
+                    df = df[mask].reset_index(drop=True)
+                    logger.info("[Weather Model Filter] Filtered dataset for [%s]: %d -> %d rows",
+                                norm_wm.upper(), n_before, len(df))
+
             logger.info("Loaded training dataset: %d rows x %d columns (RAM: %.2f MB)",
                         len(df), len(df.columns), df.memory_usage().sum() / (1024 * 1024))
             return df
 
     # Fallback to dev smoke test dataset
-    logger.info("No feature dataset specified or found. Using synthetic dataset for %s...", weather_model)
-    return generate_smoke_test_dataset(n_samples=100, weather_model=weather_model or "ecmwf_ifs")
+    logger.info("No feature dataset specified or found. Using synthetic dataset for %s...", norm_wm.upper())
+    return generate_smoke_test_dataset(n_samples=100, weather_model=norm_wm)
 
 

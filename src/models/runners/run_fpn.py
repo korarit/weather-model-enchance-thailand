@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import argparse
+import gc
 import logging
 import numpy as np
 import pandas as pd
@@ -30,6 +31,8 @@ from src.models.common import (
     standardize_dataframe_columns,
     load_training_dataset,
     get_train_val_split,
+    numpy_to_torch,
+    torch_to_numpy,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,10 +134,10 @@ def train_and_eval_fpn(
     # Strict Out-Of-Time Partitioning: Train on 2021-2023, strictly lock 2024 as Validation
     train_mask, val_mask = get_train_val_split(df, val_year=2024)
 
-    X_train_t = torch.from_numpy(df.loc[train_mask, features].fillna(0.0).to_numpy(dtype=np.float32))
-    y_train_t = torch.from_numpy(df.loc[train_mask, "target_bias"].to_numpy(dtype=np.float32))
-    X_val_t = torch.from_numpy(df.loc[val_mask, features].fillna(0.0).to_numpy(dtype=np.float32))
-    y_val_t = torch.from_numpy(df.loc[val_mask, "target_bias"].to_numpy(dtype=np.float32))
+    X_train_t = numpy_to_torch(df.loc[train_mask, features].fillna(0.0).to_numpy(dtype=np.float32))
+    y_train_t = numpy_to_torch(df.loc[train_mask, "target_bias"].to_numpy(dtype=np.float32))
+    X_val_t = numpy_to_torch(df.loc[val_mask, features].fillna(0.0).to_numpy(dtype=np.float32))
+    y_val_t = numpy_to_torch(df.loc[val_mask, "target_bias"].to_numpy(dtype=np.float32))
 
     meta_cols = [c for c in [
         "valid_time", "run_time", "lead_time_hours", "lead_time", "weather_model",
@@ -172,9 +175,9 @@ def train_and_eval_fpn(
     # Evaluate
     model.eval()
     with torch.no_grad():
-        val_pred_bias = model(X_val_t).numpy()
+        val_pred_bias = torch_to_numpy(model(X_val_t)).flatten()
 
-    y_val_arr = y_val_t.numpy()
+    y_val_arr = torch_to_numpy(y_val_t).flatten()
     raw_rmse = float(np.sqrt(np.mean(y_val_arr ** 2)))
     val_rmse = float(np.sqrt(np.mean((val_pred_bias - y_val_arr) ** 2)))
     diff_pct = ((raw_rmse - val_rmse) / raw_rmse) * 100.0 if raw_rmse > 0 else 0.0
@@ -202,8 +205,8 @@ def train_and_eval_fpn(
 
 def main():
     parser = argparse.ArgumentParser(description="Spatial Feature Pyramid Network (FPN) Bias Correction Runner")
-    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "all"], default=None, help="Target Weather Model (or 'all')")
-    parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default=None, help="Feature ablation variant")
+    parser.add_argument("--weather-model", type=str, default=None, help="Target Weather Model (e.g. 'ecmwf_ifs', 'gfs', 'ecmwf_ifs,gfs', or 'all')")
+    parser.add_argument("--ablation", type=str, default=None, help="Feature ablation variant (e.g. 'm1', 'm2', 'm3', 'm1,m2', or 'all')")
     parser.add_argument("--smoke-test", action="store_true", help="Run rapid smoke test on PC")
     parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/fpn/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")

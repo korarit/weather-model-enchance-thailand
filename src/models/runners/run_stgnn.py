@@ -31,6 +31,8 @@ from src.models.common import (
     resolve_lat_lon,
     load_training_dataset,
     get_train_val_split,
+    numpy_to_torch,
+    torch_to_numpy,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,7 +85,7 @@ def build_spatial_adjacency(lat: np.ndarray, lon: np.ndarray, max_dist_km: float
     # Normalize rows
     row_sum = adj.sum(axis=1, keepdims=True) + 1e-6
     adj = adj / row_sum
-    return torch.tensor(adj, dtype=torch.float32)
+    return numpy_to_torch(adj, dtype=torch.float32)
 
 
 def train_and_eval_stgnn(
@@ -122,13 +124,15 @@ def train_and_eval_stgnn(
         val_sub[split_idx:] = True
 
     df_sub = df.iloc[:sub_n]
-    X_train_t = torch.from_numpy(df_sub.loc[train_sub, features].fillna(0.0).to_numpy(dtype=np.float32))
-    y_train_t = torch.from_numpy(df_sub.loc[train_sub, "target_bias"].to_numpy(dtype=np.float32))
-    adj_train = adj[train_sub][:, train_sub]
+    X_train_t = numpy_to_torch(df_sub.loc[train_sub, features].fillna(0.0).to_numpy(dtype=np.float32))
+    y_train_t = numpy_to_torch(df_sub.loc[train_sub, "target_bias"].to_numpy(dtype=np.float32))
+    train_sub_t = numpy_to_torch(train_sub, dtype=torch.bool)
+    adj_train = adj[train_sub_t][:, train_sub_t]
 
-    X_val_t = torch.from_numpy(df_sub.loc[val_sub, features].fillna(0.0).to_numpy(dtype=np.float32))
-    y_val_t = torch.from_numpy(df_sub.loc[val_sub, "target_bias"].to_numpy(dtype=np.float32))
-    adj_val = adj[val_sub][:, val_sub]
+    X_val_t = numpy_to_torch(df_sub.loc[val_sub, features].fillna(0.0).to_numpy(dtype=np.float32))
+    y_val_t = numpy_to_torch(df_sub.loc[val_sub, "target_bias"].to_numpy(dtype=np.float32))
+    val_sub_t = numpy_to_torch(val_sub, dtype=torch.bool)
+    adj_val = adj[val_sub_t][:, val_sub_t]
 
     meta_cols = [c for c in [
         "valid_time", "run_time", "lead_time_hours", "lead_time", "weather_model",
@@ -166,9 +170,9 @@ def train_and_eval_stgnn(
     # Evaluate
     model.eval()
     with torch.no_grad():
-        val_pred_bias = model(X_val_t, adj_val).numpy()
+        val_pred_bias = torch_to_numpy(model(X_val_t, adj_val)).flatten()
 
-    y_val_arr = y_val_t.numpy()
+    y_val_arr = torch_to_numpy(y_val_t).flatten()
     raw_rmse = float(np.sqrt(np.mean(y_val_arr ** 2)))
     val_rmse = float(np.sqrt(np.mean((val_pred_bias - y_val_arr) ** 2)))
     diff_pct = ((raw_rmse - val_rmse) / raw_rmse) * 100.0 if raw_rmse > 0 else 0.0
@@ -196,8 +200,8 @@ def train_and_eval_stgnn(
 
 def main():
     parser = argparse.ArgumentParser(description="ST-GNN Bias Correction Runner")
-    parser.add_argument("--weather-model", choices=["ecmwf_ifs", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "all"], default=None, help="Target Weather Model (or 'all')")
-    parser.add_argument("--ablation", choices=["m1", "m2", "m3", "all"], default=None, help="Feature ablation variant")
+    parser.add_argument("--weather-model", type=str, default=None, help="Target Weather Model (e.g. 'ecmwf_ifs', 'gfs', 'ecmwf_ifs,gfs', or 'all')")
+    parser.add_argument("--ablation", type=str, default=None, help="Feature ablation variant (e.g. 'm1', 'm2', 'm3', 'm1,m2', or 'all')")
     parser.add_argument("--smoke-test", action="store_true", help="Run rapid smoke test on PC")
     parser.add_argument("--dir", "--out-dir", "--output-dir", dest="dir", type=str, default="outputs/stgnn/", help="Base output directory")
     parser.add_argument("--config", type=str, help="Optional YAML config path")
