@@ -21,6 +21,7 @@ import torch.optim as optim
 
 from src.models.common import (
     ABLATION_FEATURES,
+    get_ablation_features,
     generate_smoke_test_dataset,
     export_predictions,
     assert_no_dwr_leakage,
@@ -85,7 +86,7 @@ def train_and_eval_unet(
 ):
     """Trains Convolutional U-Net on feature representations and exports predictions."""
     import gc
-    features = ABLATION_FEATURES[ablation]
+    features = get_ablation_features(df, ablation)
     logger.info("Training Spatial U-Net on [%s] [%s] with %d features (smoke_test=%s)...", weather_model.upper(), ablation.upper(), len(features), smoke_test)
 
     # Strict Out-Of-Time Partitioning: Train on 2021-2023, strictly lock 2024 as Validation

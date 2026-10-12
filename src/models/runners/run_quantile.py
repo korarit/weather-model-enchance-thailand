@@ -19,6 +19,7 @@ import lightgbm as lgb
 
 from src.models.common import (
     ABLATION_FEATURES,
+    get_ablation_features,
     generate_smoke_test_dataset,
     export_predictions,
     assert_no_dwr_leakage,
@@ -45,7 +46,7 @@ def train_and_eval_quantile(
 ):
     """Trains multi-quantile models and exports prediction intervals."""
     import gc
-    features = ABLATION_FEATURES[ablation]
+    features = get_ablation_features(df, ablation)
     logger.info("Training Multi-Quantile GBDT on [%s] [%s] for %s (smoke_test=%s)...", weather_model.upper(), ablation.upper(), QUANTILES, smoke_test)
 
     # Strict Out-Of-Time Partitioning: Train on 2021-2023, strictly lock 2024 as Validation

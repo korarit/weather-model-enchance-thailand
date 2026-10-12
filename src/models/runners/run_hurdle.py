@@ -21,6 +21,7 @@ import lightgbm as lgb
 
 from src.models.common import (
     ABLATION_FEATURES,
+    get_ablation_features,
     generate_smoke_test_dataset,
     export_predictions,
     assert_no_dwr_leakage,
@@ -47,7 +48,7 @@ def train_and_eval_hurdle(
 ):
     """Trains Two-Stage Hurdle Model and exports predictions."""
     import gc
-    features = ABLATION_FEATURES[ablation]
+    features = get_ablation_features(df, ablation)
     logger.info("Training Two-Stage Hurdle on [%s] [%s] (smoke_test=%s)...", weather_model.upper(), ablation.upper(), smoke_test)
 
     # Strict Out-Of-Time Partitioning: Train on 2021-2023, strictly lock 2024 as Validation

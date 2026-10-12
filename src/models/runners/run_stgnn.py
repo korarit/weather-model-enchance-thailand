@@ -21,6 +21,7 @@ import torch.optim as optim
 
 from src.models.common import (
     ABLATION_FEATURES,
+    get_ablation_features,
     generate_smoke_test_dataset,
     export_predictions,
     assert_no_dwr_leakage,
@@ -94,7 +95,7 @@ def train_and_eval_stgnn(
 ):
     """Trains ST-GNN on spatial graph and exports predictions."""
     import gc
-    features = ABLATION_FEATURES[ablation]
+    features = get_ablation_features(df, ablation)
     logger.info("Training ST-GNN on [%s] [%s] with %d features (smoke_test=%s)...", weather_model.upper(), ablation.upper(), len(features), smoke_test)
 
     lat_s, lon_s = resolve_lat_lon(df)

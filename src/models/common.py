@@ -62,6 +62,23 @@ ABLATION_FEATURES = {
 }
 
 
+def get_ablation_features(df: pd.DataFrame, ablation: str) -> List[str]:
+    """
+    Returns available features for requested ablation present in DataFrame.
+    Gracefully handles datasets with missing optional features with a warning instead of failing.
+    """
+    all_feats = ABLATION_FEATURES.get(ablation, [])
+    present = [f for f in all_feats if f in df.columns]
+    if len(present) < len(all_feats):
+        missing = [f for f in all_feats if f not in df.columns]
+        logger.warning(
+            "Ablation %s: %d/%d features missing in dataset (e.g. %s). Using %d available features.",
+            ablation.upper(), len(missing), len(all_feats), missing[:3], len(present)
+        )
+        return present if present else all_feats
+    return all_feats
+
+
 def assert_no_dwr_leakage(file_path_or_str: str):
     """Guarantees that DWR station dataset is 100% BLIND and NEVER used in training."""
     s = str(file_path_or_str).lower()
@@ -385,8 +402,17 @@ def export_predictions(
     else:
         obs_rain_series = nwp_raw.astype(np.float32)
 
-    valid_time_series = pd.to_datetime(df["valid_time"]).dt.strftime("%Y-%m-%dT%H:%M:%SZ") if "valid_time" in df.columns else pd.Series("2021-01-01T00:00:00Z", index=df.index)
-    run_time_series = pd.to_datetime(df["run_time"]).dt.strftime("%Y-%m-%dT%H:%M:%SZ") if "run_time" in df.columns else pd.Series("2021-01-01T00:00:00Z", index=df.index)
+    def _fast_format_time(col_name: str, default_val: str) -> pd.Series:
+        if col_name not in df.columns:
+            return pd.Series(default_val, index=df.index)
+        s = df[col_name]
+        # Fast path if already ISO formatted strings
+        if pd.api.types.is_string_dtype(s) or (len(s) > 0 and isinstance(s.iloc[0], str) and "T" in s.iloc[0]):
+            return s
+        return pd.to_datetime(s).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    valid_time_series = _fast_format_time("valid_time", "2021-01-01T00:00:00Z")
+    run_time_series = _fast_format_time("run_time", "2021-01-01T00:00:00Z")
     lead_time_series = df["lead_time_hours"].astype(int) if "lead_time_hours" in df.columns else (df["lead_time"].astype(int) if "lead_time" in df.columns else pd.Series(0, index=df.index, dtype=int))
 
     out_df = pd.DataFrame({
@@ -413,21 +439,46 @@ def export_predictions(
     csv_path = pred_dir / f"{weather_model}_{model_name}_{ablation}_pred.csv"
     parquet_path = pred_dir / f"{weather_model}_{model_name}_{ablation}_pred.parquet"
 
+    # Save high-speed compressed Parquet artifact
     out_df.to_parquet(parquet_path, index=False, compression="snappy")
-    # Stream CSV export in chunks to prevent large RAM buffer allocation
-    out_df.to_csv(csv_path, index=False, chunksize=100000)
-    
-    # Also save standard filename for backward compatibility without re-serializing
-    compat_csv = pred_dir / f"{model_name}_{ablation}_pred.csv"
-    import shutil
-    shutil.copyfile(csv_path, compat_csv)
-    
+
+    # Link/copy standard Parquet file for backward compatibility
+    compat_parquet = pred_dir / f"{model_name}_{ablation}_pred.parquet"
+    if weather_model in ("ecmwf_ifs", "ecmwf") or not compat_parquet.exists():
+        try:
+            if compat_parquet.exists():
+                compat_parquet.unlink()
+            os.link(parquet_path, compat_parquet)
+        except Exception:
+            import shutil
+            shutil.copyfile(parquet_path, compat_parquet)
+
+    # Check whether CSV export is enabled (enabled by default; set EXPORT_PREDICTIONS_CSV=0 to bypass for 10x faster export)
+    export_csv = os.getenv("EXPORT_PREDICTIONS_CSV", "true").strip().lower() not in ("false", "0", "no")
+    if export_csv:
+        # Stream CSV export with larger chunksize (250,000) to minimize I/O syscall latency on Google Drive FUSE
+        out_df.to_csv(csv_path, index=False, chunksize=250000)
+
+        # Backward compatibility CSV: only link/copy for primary baseline (ecmwf_ifs) or if file doesn't exist yet
+        # Avoids duplicating 400 MB per run across network filesystems like Drive FUSE
+        compat_csv = pred_dir / f"{model_name}_{ablation}_pred.csv"
+        if weather_model in ("ecmwf_ifs", "ecmwf") or not compat_csv.exists():
+            try:
+                if compat_csv.exists():
+                    compat_csv.unlink()
+                os.link(csv_path, compat_csv)
+            except Exception:
+                import shutil
+                shutil.copyfile(csv_path, compat_csv)
+    else:
+        logger.info("[Fast Export] Skipped CSV export for %s (Parquet saved). Set EXPORT_PREDICTIONS_CSV=true to re-enable CSV.", csv_path.name)
+
     n_exported = len(out_df)
     del out_df
     import gc
     gc.collect()
 
-    logger.info("Exported predictions for %s [%s] (%s): %s (%d rows)", weather_model, model_name, ablation, csv_path.name, n_exported)
+    logger.info("Exported predictions for %s [%s] (%s): %s (%d rows)", weather_model, model_name, ablation, csv_path.name if export_csv else parquet_path.name, n_exported)
     return csv_path, parquet_path
 
 

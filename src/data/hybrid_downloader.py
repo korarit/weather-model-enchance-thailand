@@ -278,7 +278,7 @@ def download_gfs_cycle_from_aws(
     coords: List[Tuple[float, float]],
     raw_dir: Optional[Path] = None,
     max_lead_hours: int = DEFAULT_MAX_LEAD,
-    max_workers: int = 6,
+    max_workers: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Downloads full forecast horizon of a GFS cycle from NOAA AWS S3
@@ -290,6 +290,7 @@ def download_gfs_cycle_from_aws(
     run_time = pd.Timestamp(f"{date_str} {cycle_str}")
     date_clean = date_str.replace("-", "")
     cycle_clean = f"{chour:02d}z"
+    effective_workers = max_workers or int(os.getenv("GFS_AWS_MAX_WORKERS", "16"))
 
     raw_base = Path(raw_dir) if raw_dir else DEFAULT_RAW_NWP_DIR
     raw_gfs_dir = raw_base / "gfs" / f"run_{date_clean}_{cycle_clean}"
@@ -298,17 +299,27 @@ def download_gfs_cycle_from_aws(
     logger.info("Ingesting GFS directly from AWS S3 (noaa-gfs-bdp-pds) for %s %s across %d location(s)...",
                 date_str, cycle_clean, len(coords))
 
-    # Resolve S3 keys for available lead steps
+    # Fast resolution: GFS format (atmos/ vs root) is invariant across leads within a cycle.
+    # Check lead 1 first; if found, generate remaining keys without 24 sequential S3 head_object calls.
+    first_key = resolve_gfs_s3_key(date_str, chour, 1, s3_client=s3)
     lead_keys = {}
-    for lead in range(1, max_lead_hours + 1):
-        k = resolve_gfs_s3_key(date_str, chour, lead, s3_client=s3)
-        if k:
-            lead_keys[lead] = k
+    if first_key:
+        is_atmos = "/atmos/" in first_key
+        prefix = f"gfs.{date_clean}/{chour:02d}/atmos/gfs.t{chour:02d}z.pgrb2.0p25." if is_atmos else f"gfs.{date_clean}/{chour:02d}/gfs.t{chour:02d}z.pgrb2.0p25."
+        for lead in range(1, max_lead_hours + 1):
+            lead_keys[lead] = f"{prefix}f{lead:03d}"
+    else:
+        # Fallback: check each lead step sequentially
+        for lead in range(1, max_lead_hours + 1):
+            k = resolve_gfs_s3_key(date_str, chour, lead, s3_client=s3)
+            if k:
+                lead_keys[lead] = k
 
     if not lead_keys:
         raise RuntimeError(f"No GFS S3 keys found for {date_str} {cycle_str} in bucket {NOAA_GFS_S3_BUCKET}")
 
-    logger.info("Found %d lead step(s) on AWS S3 for GFS run %s %s", len(lead_keys), date_str, cycle_clean)
+    logger.info("Found %d lead step(s) on AWS S3 for GFS run %s %s (using %d workers)",
+                len(lead_keys), date_str, cycle_clean, effective_workers)
 
     # Check for existing raw checkpoints on disk
     lead_data: Dict[int, Dict[str, List[float]]] = {}
@@ -335,7 +346,7 @@ def download_gfs_cycle_from_aws(
 
     if missing_leads:
         logger.info("Fetching remaining %d/%d GFS lead step(s) from AWS S3...", len(missing_leads), len(lead_keys))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             future_map = {
                 executor.submit(fetch_gfs_s3_single_lead, key, coords, s3): (lead, key)
                 for lead, key in missing_leads.items()
@@ -507,20 +518,11 @@ def fetch_open_meteo_single(
                 if isinstance(data, list):
                     data = data[0] if data else {}
 
-                # Save raw JSON checkpoint atomically and flush to disk / Google Drive FUSE
+                # Save raw JSON checkpoint atomically
                 tmp_file = raw_file.with_suffix(".tmp")
                 with open(tmp_file, "w", encoding="utf-8") as f:
                     json.dump(data, f)
-                    f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except OSError:
-                        pass
                 tmp_file.replace(raw_file)
-                try:
-                    os.sync()
-                except AttributeError:
-                    pass
                 logger.debug("[Saved Raw Checkpoint] Saved Open-Meteo JSON for (%.4f, %.4f) to: %s", lat, lon, raw_file)
                 return data
 
@@ -832,9 +834,10 @@ def download_open_meteo_date_range(
                 model_key.upper(), total_locs, start_str, end_date, actual_delay)
 
     # Phase 1: Ensure all locations have raw JSON downloaded and checkpointed to raw_dir
+    station_cache: Dict[Tuple[float, float], Dict[str, Any]] = {}
     for idx, (lat, lon) in enumerate(coords, start=1):
         try:
-            fetch_open_meteo_single(
+            loc_data = fetch_open_meteo_single(
                 lat=lat,
                 lon=lon,
                 model_key=model_key,
@@ -842,6 +845,7 @@ def download_open_meteo_date_range(
                 end_date=api_end_str,
                 raw_dir=raw_dir,
             )
+            station_cache[(round(lat, 4), round(lon, 4))] = loc_data
             if idx % 50 == 1 or idx == total_locs or total_locs <= 10:
                 pct = (idx / total_locs) * 100
                 logger.info("[%s Raw Checkpoint: %d/%d (%.1f%%)] Loaded/Fetched (%.4f, %.4f)",
@@ -879,15 +883,21 @@ def download_open_meteo_date_range(
 
         chunk_dfs = []
         for lat, lon in coords:
+            coord_key = (round(lat, 4), round(lon, 4))
             try:
-                loc_resp = fetch_open_meteo_single(
-                    lat=lat,
-                    lon=lon,
-                    model_key=model_key,
-                    start_date=start_str,
-                    end_date=api_end_str,
-                    raw_dir=raw_dir,
-                )
+                # Use in-memory station cache to eliminate redundant disk/FUSE I/O
+                loc_resp = station_cache.get(coord_key)
+                if loc_resp is None:
+                    loc_resp = fetch_open_meteo_single(
+                        lat=lat,
+                        lon=lon,
+                        model_key=model_key,
+                        start_date=start_str,
+                        end_date=api_end_str,
+                        raw_dir=raw_dir,
+                    )
+                    station_cache[coord_key] = loc_resp
+
                 df_loc = map_rolling_window_to_cycles(
                     hourly_data=loc_resp,
                     lat=lat,

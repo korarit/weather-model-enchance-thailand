@@ -21,6 +21,7 @@ import torch.optim as optim
 
 from src.models.common import (
     ABLATION_FEATURES,
+    get_ablation_features,
     generate_smoke_test_dataset,
     export_predictions,
     assert_no_dwr_leakage,
@@ -123,7 +124,7 @@ def train_and_eval_fpn(
     smoke_test: bool = False
 ):
     """Trains Feature Pyramid Network (FPN) on multi-modal features and exports predictions."""
-    features = ABLATION_FEATURES[ablation]
+    features = get_ablation_features(df, ablation)
     logger.info("Training Spatial FPN on [%s] [%s] with %d features (smoke_test=%s)...",
                 weather_model.upper(), ablation.upper(), len(features), smoke_test)
 
