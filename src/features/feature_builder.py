@@ -149,6 +149,8 @@ def assemble_unified_training_matrix(
     # Maintain lat/lon aliases alongside target_lat/target_lon for seamless modeling interoperability
     merged["lat"] = merged["target_lat"]
     merged["lon"] = merged["target_lon"]
+    if "weather_model" not in merged.columns and "origin" in merged.columns:
+        merged["weather_model"] = merged["origin"]
 
     # Add Target: observed_rain and target_bias
     if observed_rain_dict:
@@ -292,7 +294,10 @@ def build_feature_matrices(
         pct = (idx / total_targets) * 100
         nwp_df = pd.read_parquet(f)
         run_time = nwp_df["run_time"].iloc[0]
-        out_file = output_dir / f"training_features_{run_time.strftime('%Y%m%d_%Hz')}.parquet"
+        model_tag = ""
+        if f.parent != out_nwp_dir and f.parent.name in ("gfs", "jma_gsm", "ncep_gfs", "dwd_icon", "cmc_gem", "bom_access", "meteo_arpege"):
+            model_tag = f"{f.parent.name}_"
+        out_file = output_dir / f"training_features_{model_tag}{run_time.strftime('%Y%m%d_%Hz')}.parquet"
 
         # Checkpoint / Resume resilience: skip already processed cycles
         if out_file.exists() and not overwrite:
