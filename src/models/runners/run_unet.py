@@ -38,45 +38,64 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-class UNet1DBlock(nn.Module):
-    """Convolutional Residual Block for 1D/2D Feature Downscaling."""
-    def __init__(self, in_channels: int, out_channels: int):
+class UNetResidualBlock(nn.Module):
+    """Residual Dense Block with LayerNorm and GELU for high-fidelity representation."""
+    def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(inplace=True),
-        )
+        self.fc1 = nn.Linear(in_dim, out_dim)
+        self.norm1 = nn.LayerNorm(out_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(out_dim, out_dim)
+        self.norm2 = nn.LayerNorm(out_dim)
+        self.shortcut = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+        res = self.shortcut(x)
+        h = self.act(self.norm1(self.fc1(x)))
+        h = self.norm2(self.fc2(h))
+        return self.act(h + res)
 
 
 class SpatialUNetModel(nn.Module):
-    """Lightweight Convolutional U-Net Architecture for tabular gridded bias correction."""
-    def __init__(self, in_features: int, hidden_dim: int = 32):
+    """
+    Contracting-Expanding U-Net Architecture with Skip Connections.
+    Encodes multi-modal meteorological & topographic features through a contraction bottleneck,
+    then progressively reconstructs via decoding layers fused with skip connections from
+    the encoder pathway.
+    """
+    def __init__(self, in_features: int, hidden_dim: int = 64):
         super().__init__()
-        self.in_proj = nn.Linear(in_features, hidden_dim)
-        self.enc1 = UNet1DBlock(1, 16)
-        self.enc2 = UNet1DBlock(16, 32)
-        self.dec1 = UNet1DBlock(32, 16)
+        # Encoder (Contracting pathway)
+        h1_dim = hidden_dim * 2
+        h2_dim = hidden_dim
+        b_dim = max(16, hidden_dim // 2)
+
+        self.enc1 = UNetResidualBlock(in_features, h1_dim)
+        self.enc2 = UNetResidualBlock(h1_dim, h2_dim)
+        self.bottleneck = UNetResidualBlock(h2_dim, b_dim)
+
+        # Decoder (Expanding pathway with skip connections)
+        self.dec2 = UNetResidualBlock(b_dim + h2_dim, h2_dim)
+        self.dec1 = UNetResidualBlock(h2_dim + h1_dim, h1_dim)
+
+        # Output regression head
         self.out_head = nn.Sequential(
-            nn.Linear(16 * hidden_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(h1_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [Batch, in_features]
-        h = torch.relu(self.in_proj(x)).unsqueeze(1)  # [Batch, 1, hidden_dim]
-        e1 = self.enc1(h)                              # [Batch, 16, hidden_dim]
-        e2 = self.enc2(e1)                             # [Batch, 32, hidden_dim]
-        d1 = self.dec1(e2)                             # [Batch, 16, hidden_dim]
-        flat = d1.view(d1.size(0), -1)
-        return self.out_head(flat).squeeze(-1)
+        e1 = self.enc1(x)                                 # Contracting Stage 1
+        e2 = self.enc2(e1)                                # Contracting Stage 2
+        b = self.bottleneck(e2)                           # Bottleneck representation
+
+        # Expanding pathway with U-Net skip connection concatenation
+        d2 = self.dec2(torch.cat([b, e2], dim=-1))        # Fuse bottleneck + skip e2
+        d1 = self.dec1(torch.cat([d2, e1], dim=-1))       # Fuse d2 + skip e1
+        return self.out_head(d1).squeeze(-1)
 
 
 def train_and_eval_unet(
@@ -94,9 +113,19 @@ def train_and_eval_unet(
     # Strict Out-Of-Time Partitioning: Train on 2021-2023, strictly lock 2024 as Validation
     train_mask, val_mask = get_train_val_split(df, val_year=2024)
 
-    X_train_t = numpy_to_torch(df.loc[train_mask, features].fillna(0.0).to_numpy(dtype=np.float32))
+    # Feature normalization to prevent large magnitude distortion (CAPE/Pressure vs Small features)
+    x_train_raw = df.loc[train_mask, features].fillna(0.0).to_numpy(dtype=np.float32)
+    feat_mean = np.nanmean(x_train_raw, axis=0, keepdims=True)
+    feat_std = np.nanstd(x_train_raw, axis=0, keepdims=True)
+    feat_std[feat_std < 1e-6] = 1.0
+
+    x_train_norm = np.nan_to_num((x_train_raw - feat_mean) / feat_std, nan=0.0)
+    x_val_raw = df.loc[val_mask, features].fillna(0.0).to_numpy(dtype=np.float32)
+    x_val_norm = np.nan_to_num((x_val_raw - feat_mean) / feat_std, nan=0.0)
+
+    X_train_t = numpy_to_torch(x_train_norm)
     y_train_t = numpy_to_torch(df.loc[train_mask, "target_bias"].to_numpy(dtype=np.float32))
-    X_val_t = numpy_to_torch(df.loc[val_mask, features].fillna(0.0).to_numpy(dtype=np.float32))
+    X_val_t = numpy_to_torch(x_val_norm)
     y_val_t = numpy_to_torch(df.loc[val_mask, "target_bias"].to_numpy(dtype=np.float32))
 
     meta_cols = [c for c in [
@@ -106,23 +135,32 @@ def train_and_eval_unet(
     ] if c in df.columns]
     df_val = df.loc[val_mask, meta_cols].copy()
 
-
     model = SpatialUNetModel(in_features=len(features), hidden_dim=16 if smoke_test else 32)
     criterion = nn.HuberLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    optimizer = optim.Adam(model.parameters(), lr=0.005)
 
-    epochs = 2 if smoke_test else 20
+    batch_size = 16 if smoke_test else min(512, max(64, len(X_train_t) // 20))
+    train_dataset = torch.utils.data.TensorDataset(X_train_t, y_train_t)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    epochs = 2 if smoke_test else 15
     model.train()
     for ep in range(1, epochs + 1):
-        optimizer.zero_grad()
-        out = model(X_train_t)
-        loss = criterion(out, y_train_t)
-        loss.backward()
-        optimizer.step()
-        logger.info("  -> [U-Net Epoch %d/%d] Training Huber Loss: %.4f", ep, epochs, loss.item())
+        total_loss = 0.0
+        n_batches = 0
+        for batch_x, batch_y in train_loader:
+            optimizer.zero_grad()
+            out = model(batch_x)
+            loss = criterion(out, batch_y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+        avg_loss = total_loss / max(1, n_batches)
+        logger.info("  -> [U-Net Epoch %d/%d] Training Huber Loss: %.4f", ep, epochs, avg_loss)
 
     # Free training tensors
-    del X_train_t, y_train_t
+    del X_train_t, y_train_t, train_dataset, train_loader
     gc.collect()
 
     # Save checkpoint
@@ -138,8 +176,11 @@ def train_and_eval_unet(
         val_pred_bias = torch_to_numpy(model(X_val_t)).flatten()
 
     y_val_arr = torch_to_numpy(y_val_t).flatten()
-    raw_rmse = float(np.sqrt(np.mean(y_val_arr ** 2)))
-    val_rmse = float(np.sqrt(np.mean((val_pred_bias - y_val_arr) ** 2)))
+    nwp_raw_val = df_val["nwp_rain_raw"].to_numpy(dtype=float) if "nwp_rain_raw" in df_val.columns else np.zeros(len(df_val))
+    obs_val = df_val["observed_rain"].to_numpy(dtype=float) if "observed_rain" in df_val.columns else (nwp_raw_val + y_val_arr)
+    raw_rmse = float(np.sqrt(np.mean((nwp_raw_val - obs_val) ** 2)))
+    corrected_val = np.maximum(0.0, nwp_raw_val + val_pred_bias)
+    val_rmse = float(np.sqrt(np.mean((corrected_val - obs_val) ** 2)))
     diff_pct = ((raw_rmse - val_rmse) / raw_rmse) * 100.0 if raw_rmse > 0 else 0.0
 
     logger.info(

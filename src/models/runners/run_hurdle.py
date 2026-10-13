@@ -86,13 +86,14 @@ def train_and_eval_hurdle(
     )
     clf.fit(X_train, y_bin_train)
 
-    # STAGE 2: Conditional Bias Regressor (trained only on positive rain instances)
+    # STAGE 2: Conditional Amount Regressor (trained on positive rainfall events: E[Y | Y >= threshold])
+    y_obs_train = df.loc[train_mask, "observed_rain"] if "observed_rain" in df.columns else (df.loc[train_mask, "nwp_rain_raw"] + y_bias_train)
     pos_mask_train = y_bin_train == 1
     if pos_mask_train.sum() < 2:
         pos_mask_train = np.ones(len(y_bin_train), dtype=bool)
 
     reg_params = {
-        "objective": "regression_l1",
+        "objective": "regression",
         "n_estimators": n_estimators,
         "num_leaves": 15 if smoke_test else 31,
         "learning_rate": 0.05,
@@ -104,10 +105,10 @@ def train_and_eval_hurdle(
         reg_params.update(hyperparams)
 
     reg = lgb.LGBMRegressor(**reg_params)
-    reg.fit(X_train[pos_mask_train], y_bias_train[pos_mask_train])
+    reg.fit(X_train[pos_mask_train], y_obs_train[pos_mask_train])
 
     # Free training matrices immediately
-    del X_train, y_bin_train, y_bias_train, pos_mask_train
+    del X_train, y_bin_train, y_bias_train, y_obs_train, pos_mask_train
     gc.collect()
 
     # Save checkpoints
@@ -117,17 +118,18 @@ def train_and_eval_hurdle(
     reg.booster_.save_model(str(model_dir / "reg.txt"))
     logger.info("Saved Hurdle checkpoints in %s", model_dir)
 
-    # Inference: Combined Decision
+    # Inference: Canonical Hurdle Expected Value E[Y|X] = P(Rain >= th|X) * E[Y | Rain >= th, X]
     probs = clf.predict_proba(X_val)[:, 1]
-    bias_preds_cond = reg.predict(X_val)
-    
-    # If prob < threshold -> predicted_rain = 0, meaning predicted_bias = -nwp_raw
-    nwp_raw_val = df_val["nwp_rain_raw"].to_numpy(dtype=float)
-    final_bias_pred = np.where(probs >= prob_threshold, bias_preds_cond, -nwp_raw_val)
+    pred_cond_rain = np.maximum(rain_threshold, reg.predict(X_val))
+    expected_rain = probs * pred_cond_rain
 
-    y_bias_arr = y_bias_val.to_numpy()
-    raw_rmse = float(np.sqrt(np.mean(y_bias_arr ** 2)))
-    val_rmse = float(np.sqrt(np.mean((final_bias_pred - y_bias_arr) ** 2)))
+    nwp_raw_val = df_val["nwp_rain_raw"].to_numpy(dtype=float) if "nwp_rain_raw" in df_val.columns else np.zeros(len(df_val))
+    final_bias_pred = expected_rain - nwp_raw_val
+
+    obs_val = df_val["observed_rain"].to_numpy(dtype=float) if "observed_rain" in df_val.columns else (nwp_raw_val + y_bias_val.to_numpy(dtype=float))
+    raw_rmse = float(np.sqrt(np.mean((nwp_raw_val - obs_val) ** 2)))
+    corrected_val = np.maximum(0.0, nwp_raw_val + final_bias_pred)
+    val_rmse = float(np.sqrt(np.mean((corrected_val - obs_val) ** 2)))
     diff_pct = ((raw_rmse - val_rmse) / raw_rmse) * 100.0 if raw_rmse > 0 else 0.0
 
     logger.info(
@@ -135,7 +137,7 @@ def train_and_eval_hurdle(
         weather_model.upper(), ablation.upper(), raw_rmse, val_rmse, diff_pct, len(y_bias_val)
     )
 
-    del X_val, y_bin_val, y_bias_val, probs, bias_preds_cond
+    del X_val, y_bin_val, y_bias_val, probs, pred_cond_rain
     gc.collect()
 
     export_predictions(

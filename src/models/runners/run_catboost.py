@@ -95,9 +95,11 @@ def train_and_eval_catboost(
     logger.info("Saved CatBoost checkpoint: %s", ckpt_file)
 
     val_pred_bias = model.predict(X_val)
-    y_val_arr = y_val.to_numpy()
-    raw_rmse = float(np.sqrt(np.mean(y_val_arr ** 2)))
-    val_rmse = float(np.sqrt(np.mean((val_pred_bias - y_val_arr) ** 2)))
+    nwp_raw_val = df_val["nwp_rain_raw"].to_numpy(dtype=float) if "nwp_rain_raw" in df_val.columns else np.zeros(len(df_val))
+    obs_val = df_val["observed_rain"].to_numpy(dtype=float) if "observed_rain" in df_val.columns else (nwp_raw_val + y_val.to_numpy(dtype=float))
+    raw_rmse = float(np.sqrt(np.mean((nwp_raw_val - obs_val) ** 2)))
+    corrected_val = np.maximum(0.0, nwp_raw_val + val_pred_bias)
+    val_rmse = float(np.sqrt(np.mean((corrected_val - obs_val) ** 2)))
     diff_pct = ((raw_rmse - val_rmse) / raw_rmse) * 100.0 if raw_rmse > 0 else 0.0
 
     logger.info(

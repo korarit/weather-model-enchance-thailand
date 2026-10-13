@@ -85,30 +85,62 @@ def assemble_unified_training_matrix(
 
     logger.info("Assembling unified matrix for run_time: %s (%d NWP rows)...", run_time, len(nwp_forecast_df))
 
-    # Merge Topographic features by grid_id (or nearest centroid)
+    # Merge Topographic features by grid_id, with robust spatial fallback to Master Grid coordinates
     topo_cols = [
         "grid_id", "elevation_m", "elevation_std", "slope_deg",
         "aspect_sin", "aspect_cos", "dist_coast_km", "coriolis_param"
     ]
-    grid_sub = grid_df[topo_cols].drop_duplicates("grid_id")
+    avail_topo_cols = [c for c in topo_cols if c in grid_df.columns]
+    grid_sub = grid_df[avail_topo_cols].drop_duplicates("grid_id")
     merged = nwp_forecast_df.merge(grid_sub, on="grid_id", how="left")
 
-    # If grid_id was missing from grid_df, fill with median topography
+    # Spatial fallback: if grid_id didn't match directly, query nearest master grid centroid
+    topo_val_cols = [c for c in ["elevation_m", "elevation_std", "slope_deg", "aspect_sin", "aspect_cos", "dist_coast_km", "coriolis_param"] if c in grid_df.columns]
+    if "centroid_lat" in grid_df.columns and "centroid_lon" in grid_df.columns and topo_val_cols:
+        missing_mask = merged["elevation_m"].isna() if "elevation_m" in merged.columns else pd.Series(True, index=merged.index)
+        if missing_mask.any():
+            from scipy.spatial import KDTree
+            master_valid = grid_df.dropna(subset=["centroid_lat", "centroid_lon"]).copy()
+            master_coords = master_valid[["centroid_lat", "centroid_lon"]].to_numpy(dtype=float)
+            target_coords = merged.loc[missing_mask, ["lat", "lon"]].to_numpy(dtype=float)
+            if len(master_coords) > 0 and len(target_coords) > 0:
+                master_tree = KDTree(master_coords)
+                _, nearest_indices = master_tree.query(target_coords)
+                matched_rows = master_valid.iloc[nearest_indices]
+                for col in topo_val_cols:
+                    merged.loc[missing_mask, col] = matched_rows[col].values
+
+    # Final safeguard for any remaining coordinates outside coverage
     for col in ["elevation_m", "elevation_std", "slope_deg", "dist_coast_km"]:
-        if col in merged.columns:
+        if col in merged.columns and merged[col].isna().any():
             merged[col] = merged[col].fillna(merged[col].median() if not merged[col].dropna().empty else 10.0)
     for col in ["aspect_sin", "aspect_cos", "coriolis_param"]:
-        if col in merged.columns:
+        if col in merged.columns and merged[col].isna().any():
             merged[col] = merged[col].fillna(0.0)
 
-    # Merge Satellite Features by grid_id
+    # Merge Satellite Features using spatial KDTree nearest-neighbor lookup
     sat_cols = [
-        "grid_id", "bt_mean_t0", "bt_min_t0", "bt_std",
+        "bt_mean_t0", "bt_min_t0", "bt_std",
         "bt_mean_lag10m", "bt_mean_lag20m", "bt_mean_lag30m",
         "delta_bt_30", "is_rapid_cooling", "is_deep_convective", "wv_mean"
     ]
-    sat_sub = himawari_features_df[[c for c in sat_cols if c in himawari_features_df.columns]].drop_duplicates("grid_id")
-    merged = merged.merge(sat_sub, on="grid_id", how="left")
+    present_sat_cols = [c for c in sat_cols if c in himawari_features_df.columns]
+    unique_cells = merged[["grid_id", "lat", "lon"]].drop_duplicates("grid_id")
+
+    if not himawari_features_df.empty and "lat" in himawari_features_df.columns and "lon" in himawari_features_df.columns and present_sat_cols:
+        from scipy.spatial import KDTree
+        sat_sub = himawari_features_df.dropna(subset=["lat", "lon"]).drop_duplicates(subset=["lat", "lon"]).copy()
+        sat_coords = sat_sub[["lat", "lon"]].to_numpy(dtype=float)
+        sat_tree = KDTree(sat_coords)
+        grid_coords = unique_cells[["lat", "lon"]].to_numpy(dtype=float)
+        _, nearest_sat_idx = sat_tree.query(grid_coords)
+
+        sat_matched = sat_sub.iloc[nearest_sat_idx][present_sat_cols].copy().reset_index(drop=True)
+        sat_matched["grid_id"] = unique_cells["grid_id"].values
+        merged = merged.merge(sat_matched, on="grid_id", how="left")
+    elif "grid_id" in himawari_features_df.columns:
+        sat_sub = himawari_features_df[[c for c in ["grid_id"] + present_sat_cols if c in himawari_features_df.columns]].drop_duplicates("grid_id")
+        merged = merged.merge(sat_sub, on="grid_id", how="left")
 
     # Fill satellite defaults if cloudy data missing
     merged["bt_mean_t0"] = merged["bt_mean_t0"].fillna(285.0)
@@ -120,7 +152,6 @@ def assemble_unified_training_matrix(
     merged["wv_mean"] = merged["wv_mean"].fillna(245.0)
 
     # Compute Ground Spatial Observation Features per grid cell
-    unique_cells = merged[["grid_id", "lat", "lon"]].drop_duplicates("grid_id")
     spatial_records = []
 
     for _, row in unique_cells.iterrows():
@@ -154,11 +185,25 @@ def assemble_unified_training_matrix(
 
     # Add Target: observed_rain and target_bias
     if observed_rain_dict:
-        merged["observed_rain"] = merged["grid_id"].map(observed_rain_dict).fillna(np.nan)
+        if "valid_time" in merged.columns and any(isinstance(k, tuple) for k in list(observed_rain_dict.keys())[:5]):
+            vt_series = pd.to_datetime(merged["valid_time"])
+            lookup_keys = list(zip(merged["grid_id"], vt_series))
+            merged["observed_rain"] = [observed_rain_dict.get(k, np.nan) for k in lookup_keys]
+        else:
+            merged["observed_rain"] = merged["grid_id"].map(observed_rain_dict).fillna(np.nan)
+
+        n_valid_obs = int(merged["observed_rain"].notna().sum())
+        if n_valid_obs > 0:
+            logger.info("Matched %d/%d rows with valid ground observation labels.", n_valid_obs, len(merged))
+            # Strict supervised learning: retain cells with valid observation labels
+            merged = merged.dropna(subset=["observed_rain"]).reset_index(drop=True)
+        else:
+            logger.warning("No ground observation labels matched for cycle %s. Using development synthetic baseline.", run_time)
+            np.random.seed(int(pd.to_datetime(run_time).timestamp()) % 100000)
+            true_rain = merged["nwp_rain_raw"] * np.random.uniform(0.7, 1.4, size=len(merged)) + np.random.normal(0, 0.2, size=len(merged))
+            merged["observed_rain"] = np.clip(true_rain, 0.0, 300.0).round(2)
     else:
-        # Synthetic / simulated ground truth for development pipeline validation
-        # Residual bias = observed - nwp
-        np.random.seed(42)
+        np.random.seed(int(pd.to_datetime(run_time).timestamp()) % 100000)
         true_rain = merged["nwp_rain_raw"] * np.random.uniform(0.7, 1.4, size=len(merged)) + np.random.normal(0, 0.2, size=len(merged))
         merged["observed_rain"] = np.clip(true_rain, 0.0, 300.0).round(2)
 
@@ -223,6 +268,118 @@ def load_hii_station_observations(
             }
 
     return obs_dict
+
+
+def load_observed_rain_labels_for_cycle(
+    clean_dir: Path,
+    nwp_forecast_df: pd.DataFrame,
+    stn_meta_df: pd.DataFrame,
+    max_station_dist_km: float = 5.0
+) -> Optional[Dict[Tuple[str, pd.Timestamp], float]]:
+    """
+    Loads real HII hourly rain observations from clean parquet partitions
+    and maps them to target 2km grid cells for each valid_time in the forecast cycle.
+    TIMEZONE ALIGNMENT PROTOCOL:
+        valid_time_ict = valid_time_utc + 7h (ICT = UTC+7)
+    ACCUMULATION WINDOW PROTOCOL:
+        Matches observation accumulation duration to NWP forecast step interval
+        (e.g. 1 hour for hourly forecasts, 6 hours for TIGGE interval).
+    """
+    if "valid_time" not in nwp_forecast_df.columns:
+        return None
+
+    valid_times = pd.to_datetime(nwp_forecast_df["valid_time"].unique())
+    if len(valid_times) == 0:
+        return None
+
+    # Determine forecast accumulation step interval
+    lead_steps = sorted(nwp_forecast_df["lead_time_hours"].dropna().unique()) if "lead_time_hours" in nwp_forecast_df.columns else []
+    if len(lead_steps) >= 2:
+        step_hours = int(lead_steps[1] - lead_steps[0])
+    elif len(lead_steps) == 1:
+        step_hours = max(1, int(lead_steps[0]))
+    else:
+        step_hours = 1
+    step_hours = max(1, step_hours)
+
+    stn_valid = stn_meta_df.dropna(subset=["latitude", "longitude", "station_code"]).copy()
+    if stn_valid.empty:
+        return None
+
+    import pyproj
+    from scipy.spatial import KDTree
+
+    to_utm = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:32647", always_xy=True)
+    stn_lons = stn_valid["longitude"].to_numpy(dtype=float)
+    stn_lats = stn_valid["latitude"].to_numpy(dtype=float)
+    s_x, s_y = to_utm.transform(stn_lons, stn_lats)
+    stn_coords_km = np.column_stack([s_x / 1000.0, s_y / 1000.0])
+    stn_tree = KDTree(stn_coords_km)
+    stn_codes = stn_valid["station_code"].tolist()
+
+    grid_sub = nwp_forecast_df[["grid_id", "lat", "lon"]].drop_duplicates("grid_id")
+    g_lons = grid_sub["lon"].to_numpy(dtype=float)
+    g_lats = grid_sub["lat"].to_numpy(dtype=float)
+    g_x, g_y = to_utm.transform(g_lons, g_lats)
+    grid_coords_km = np.column_stack([g_x / 1000.0, g_y / 1000.0])
+    
+    dists_km, nearest_stn_indices = stn_tree.query(grid_coords_km)
+    grid_ids = grid_sub["grid_id"].tolist()
+
+    grid_to_station = {
+        grid_ids[i]: (stn_codes[nearest_stn_indices[i]], dists_km[i])
+        for i in range(len(grid_ids))
+    }
+
+    years = sorted(list(set((vt + pd.Timedelta(hours=7)).year for vt in valid_times)))
+    rain_clean_base = clean_dir / "hourly_rain"
+    
+    station_dfs: Dict[str, pd.DataFrame] = {}
+    has_any_file = False
+    for y in years:
+        y_dir = rain_clean_base / f"year={y}"
+        if y_dir.exists():
+            for p in y_dir.glob("*.parquet"):
+                has_any_file = True
+                code = p.stem
+                if code not in station_dfs:
+                    try:
+                        df_p = pd.read_parquet(p)
+                        df_p["observed_at"] = pd.to_datetime(df_p["observed_at"])
+                        station_dfs[code] = df_p
+                    except Exception:
+                        pass
+
+    if not has_any_file or not station_dfs:
+        logger.info("[Ground Truth Ingestion] No ground observation files found in %s. Using development baseline.", clean_dir)
+        return None
+
+    obs_map: Dict[Tuple[str, pd.Timestamp], float] = {}
+    found_count = 0
+
+    for vt in valid_times:
+        target_ict = vt + pd.Timedelta(hours=7)
+        # Precipitation accumulation window matching NWP step interval
+        w_start = target_ict - pd.Timedelta(hours=step_hours)
+        w_end = target_ict + pd.Timedelta(minutes=15)
+        for gid, (code, dist) in grid_to_station.items():
+            if dist > max_station_dist_km:
+                continue
+            df_stn = station_dfs.get(code)
+            if df_stn is not None and not df_stn.empty:
+                sub = df_stn[(df_stn["observed_at"] > w_start) & (df_stn["observed_at"] <= w_end)]
+                if not sub.empty:
+                    if step_hours == 1:
+                        obs_val = float(sub.iloc[-1]["value"])
+                    else:
+                        obs_val = float(sub["value"].sum())
+                    obs_map[(gid, vt)] = obs_val
+                    found_count += 1
+
+    if found_count > 0:
+        logger.info("[Ground Truth Ingestion] Successfully matched %d ground observation labels from real HII telemetry across %d valid times (step=%dh).", found_count, len(valid_times), step_hours)
+        return obs_map
+    return None
 
 
 def build_feature_matrices(
@@ -317,13 +474,20 @@ def build_feature_matrices(
             lookback_hours=3
         )
 
+        obs_labels = load_observed_rain_labels_for_cycle(
+            clean_dir=hii_clean_dir,
+            nwp_forecast_df=nwp_df,
+            stn_meta_df=stn_meta_df,
+        )
+
         sat_df = load_or_extract_himawari_features(run_time, himawari_dir=himawari_dir)
         unified_matrix = assemble_unified_training_matrix(
             nwp_forecast_df=nwp_df,
             himawari_features_df=sat_df,
             station_obs_dict=station_obs,
             grid_df=grid_df,
-            indexer=indexer
+            indexer=indexer,
+            observed_rain_dict=obs_labels,
         )
         unified_matrix.to_parquet(out_file, index=False, compression="snappy")
         logger.info("  -> [%d/%d] Saved %s (%d rows)", idx, total_targets, out_file.name, len(unified_matrix))

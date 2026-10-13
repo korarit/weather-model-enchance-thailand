@@ -110,10 +110,20 @@ def train_and_eval_quantile(
 
     logger.info("Saved all quantile checkpoints in %s", model_dir)
 
-    pred_q50 = median_pred_bias if median_pred_bias is not None else quantile_preds["q50"]
-    y_val_arr = y_val.to_numpy()
-    raw_rmse = float(np.sqrt(np.mean(y_val_arr ** 2)))
-    val_rmse_q50 = float(np.sqrt(np.mean((pred_q50 - y_val_arr) ** 2)))
+    # Enforce Monotonic Non-Crossing Quantile Rearrangement (Chernozhukov et al.)
+    # Strictly ensures q10 <= q50 <= q90 <= q95 across every sample to eliminate crossing violations
+    q_tags = [f"q{int(q*100)}" for q in QUANTILES]
+    stacked_quantiles = np.column_stack([quantile_preds[tag] for tag in q_tags])
+    sorted_quantiles = np.sort(stacked_quantiles, axis=1)
+    for idx, tag in enumerate(q_tags):
+        quantile_preds[tag] = sorted_quantiles[:, idx]
+
+    pred_q50 = quantile_preds["q50"]
+    nwp_raw_val = df_val["nwp_rain_raw"].to_numpy(dtype=float) if "nwp_rain_raw" in df_val.columns else np.zeros(len(df_val))
+    obs_val = df_val["observed_rain"].to_numpy(dtype=float) if "observed_rain" in df_val.columns else (nwp_raw_val + y_val.to_numpy(dtype=float))
+    raw_rmse = float(np.sqrt(np.mean((nwp_raw_val - obs_val) ** 2)))
+    corrected_q50 = np.maximum(0.0, nwp_raw_val + pred_q50)
+    val_rmse_q50 = float(np.sqrt(np.mean((corrected_q50 - obs_val) ** 2)))
     diff_pct = ((raw_rmse - val_rmse_q50) / raw_rmse) * 100.0 if raw_rmse > 0 else 0.0
 
     logger.info(

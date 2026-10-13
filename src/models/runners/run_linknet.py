@@ -39,103 +39,66 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-class LinkNetEncoderBlock(nn.Module):
-    """Residual Encoder block for LinkNet with identity or projection shortcut."""
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+class LinkNetResidualBlock(nn.Module):
+    """Residual block for LinkNet encoder/decoder with additive projection."""
+    def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels)
-            )
+        self.fc1 = nn.Linear(in_dim, out_dim)
+        self.norm1 = nn.LayerNorm(out_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(out_dim, out_dim)
+        self.norm2 = nn.LayerNorm(out_dim)
+        self.shortcut = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         res = self.shortcut(x)
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = self.relu(out + res)
-        return out
-
-
-class LinkNetDecoderBlock(nn.Module):
-    """Decoder block with channel projection and inverted convolution."""
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        mid_channels = in_channels // 4 if in_channels > 4 else in_channels
-        self.block = nn.Sequential(
-            nn.Conv1d(in_channels, mid_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(mid_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(mid_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+        h = self.act(self.norm1(self.fc1(x)))
+        h = self.norm2(self.fc2(h))
+        return self.act(h + res)
 
 
 class SpatialLinkNetModel(nn.Module):
     """
-    LinkNet Architecture for Spatial Weather Bias Correction.
+    LinkNet Residual Feature Inversion Architecture.
     Key properties:
-    - Additive bypass skip connections (dec + enc) instead of concatenation.
-    - Parameter efficient and fast computation.
+    - Additive bypass skip connections (Decoder + Encoder) preserving LinkNet identity.
+    - Highly parameter-efficient representation inversion without memory-heavy concatenation.
     """
-    def __init__(self, in_features: int, hidden_dim: int = 32):
+    def __init__(self, in_features: int, hidden_dim: int = 64):
         super().__init__()
-        self.in_proj = nn.Linear(in_features, hidden_dim)
-
-        # Initial stem convolution
-        self.init_conv = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(16),
-            nn.ReLU(inplace=True)
-        )
+        e1_dim = hidden_dim * 2
+        e2_dim = hidden_dim
+        e3_dim = max(16, hidden_dim // 2)
 
         # Encoders
-        self.enc1 = LinkNetEncoderBlock(16, 16)
-        self.enc2 = LinkNetEncoderBlock(16, 32)
-        self.enc3 = LinkNetEncoderBlock(32, 64)
+        self.enc1 = LinkNetResidualBlock(in_features, e1_dim)
+        self.enc2 = LinkNetResidualBlock(e1_dim, e2_dim)
+        self.enc3 = LinkNetResidualBlock(e2_dim, e3_dim)
 
-        # Decoders (additive connections with encoders)
-        self.dec3 = LinkNetDecoderBlock(64, 32)
-        self.dec2 = LinkNetDecoderBlock(32, 16)
-        self.dec1 = LinkNetDecoderBlock(16, 16)
+        # Decoders (matching channel dimensions for additive bypass)
+        self.dec3 = LinkNetResidualBlock(e3_dim, e2_dim)
+        self.dec2 = LinkNetResidualBlock(e2_dim, e1_dim)
+        self.dec1 = LinkNetResidualBlock(e1_dim, hidden_dim)
 
         self.out_head = nn.Sequential(
-            nn.Linear(16 * hidden_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [Batch, in_features]
-        h = torch.relu(self.in_proj(x)).unsqueeze(1)  # [Batch, 1, hidden_dim]
-        init = self.init_conv(h)                      # [Batch, 16, hidden_dim]
-
         # Encoder passes
-        e1 = self.enc1(init)                          # [Batch, 16, hidden_dim]
-        e2 = self.enc2(e1)                            # [Batch, 32, hidden_dim]
-        e3 = self.enc3(e2)                            # [Batch, 64, hidden_dim]
+        e1 = self.enc1(x)                               # Stage 1: Fine-scale
+        e2 = self.enc2(e1)                              # Stage 2: Mesoscale
+        e3 = self.enc3(e2)                              # Stage 3: Synoptic
 
         # Decoder passes with LinkNet additive bypass
-        d3 = self.dec3(e3) + e2                       # [Batch, 32, hidden_dim]
-        d2 = self.dec2(d3) + e1                       # [Batch, 16, hidden_dim]
-        d1 = self.dec1(d2)                            # [Batch, 16, hidden_dim]
+        d3 = self.dec3(e3) + e2                         # Additive bypass e2
+        d2 = self.dec2(d3) + e1                         # Additive bypass e1
+        d1 = self.dec1(d2)
 
-        flat = d1.view(d1.size(0), -1)
-        return self.out_head(flat).squeeze(-1)
+        return self.out_head(d1).squeeze(-1)
 
 
 def train_and_eval_linknet(
@@ -153,9 +116,19 @@ def train_and_eval_linknet(
     # Strict Out-Of-Time Partitioning: Train on 2021-2023, strictly lock 2024 as Validation
     train_mask, val_mask = get_train_val_split(df, val_year=2024)
 
-    X_train_t = numpy_to_torch(df.loc[train_mask, features].fillna(0.0).to_numpy(dtype=np.float32))
+    # Feature normalization to prevent large magnitude distortion (CAPE/Pressure vs Small features)
+    x_train_raw = df.loc[train_mask, features].fillna(0.0).to_numpy(dtype=np.float32)
+    feat_mean = np.nanmean(x_train_raw, axis=0, keepdims=True)
+    feat_std = np.nanstd(x_train_raw, axis=0, keepdims=True)
+    feat_std[feat_std < 1e-6] = 1.0
+
+    x_train_norm = np.nan_to_num((x_train_raw - feat_mean) / feat_std, nan=0.0)
+    x_val_raw = df.loc[val_mask, features].fillna(0.0).to_numpy(dtype=np.float32)
+    x_val_norm = np.nan_to_num((x_val_raw - feat_mean) / feat_std, nan=0.0)
+
+    X_train_t = numpy_to_torch(x_train_norm)
     y_train_t = numpy_to_torch(df.loc[train_mask, "target_bias"].to_numpy(dtype=np.float32))
-    X_val_t = numpy_to_torch(df.loc[val_mask, features].fillna(0.0).to_numpy(dtype=np.float32))
+    X_val_t = numpy_to_torch(x_val_norm)
     y_val_t = numpy_to_torch(df.loc[val_mask, "target_bias"].to_numpy(dtype=np.float32))
 
     meta_cols = [c for c in [
@@ -165,23 +138,32 @@ def train_and_eval_linknet(
     ] if c in df.columns]
     df_val = df.loc[val_mask, meta_cols].copy()
 
-
     model = SpatialLinkNetModel(in_features=len(features), hidden_dim=16 if smoke_test else 32)
     criterion = nn.HuberLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    optimizer = optim.Adam(model.parameters(), lr=0.005)
 
-    epochs = 2 if smoke_test else 20
+    batch_size = 16 if smoke_test else min(512, max(64, len(X_train_t) // 20))
+    train_dataset = torch.utils.data.TensorDataset(X_train_t, y_train_t)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    epochs = 2 if smoke_test else 15
     model.train()
     for ep in range(1, epochs + 1):
-        optimizer.zero_grad()
-        out = model(X_train_t)
-        loss = criterion(out, y_train_t)
-        loss.backward()
-        optimizer.step()
-        logger.info("  -> [LinkNet Epoch %d/%d] Training Huber Loss: %.4f", ep, epochs, loss.item())
+        total_loss = 0.0
+        n_batches = 0
+        for batch_x, batch_y in train_loader:
+            optimizer.zero_grad()
+            out = model(batch_x)
+            loss = criterion(out, batch_y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+        avg_loss = total_loss / max(1, n_batches)
+        logger.info("  -> [LinkNet Epoch %d/%d] Training Huber Loss: %.4f", ep, epochs, avg_loss)
 
     # Free training tensors
-    del X_train_t, y_train_t
+    del X_train_t, y_train_t, train_dataset, train_loader
     gc.collect()
 
     # Save checkpoint
@@ -197,8 +179,11 @@ def train_and_eval_linknet(
         val_pred_bias = torch_to_numpy(model(X_val_t)).flatten()
 
     y_val_arr = torch_to_numpy(y_val_t).flatten()
-    raw_rmse = float(np.sqrt(np.mean(y_val_arr ** 2)))
-    val_rmse = float(np.sqrt(np.mean((val_pred_bias - y_val_arr) ** 2)))
+    nwp_raw_val = df_val["nwp_rain_raw"].to_numpy(dtype=float) if "nwp_rain_raw" in df_val.columns else np.zeros(len(df_val))
+    obs_val = df_val["observed_rain"].to_numpy(dtype=float) if "observed_rain" in df_val.columns else (nwp_raw_val + y_val_arr)
+    raw_rmse = float(np.sqrt(np.mean((nwp_raw_val - obs_val) ** 2)))
+    corrected_val = np.maximum(0.0, nwp_raw_val + val_pred_bias)
+    val_rmse = float(np.sqrt(np.mean((corrected_val - obs_val) ** 2)))
     diff_pct = ((raw_rmse - val_rmse) / raw_rmse) * 100.0 if raw_rmse > 0 else 0.0
 
     logger.info(

@@ -413,6 +413,11 @@ def standardize_dataframe_columns(df: pd.DataFrame, inplace: bool = False) -> pd
     if "nwp_rain_raw" not in df.columns and "tp" in df.columns:
         df["nwp_rain_raw"] = df["tp"]
 
+    # Target bias: compute if missing and observed_rain & nwp_rain_raw are present
+    if "target_bias" not in df.columns:
+        if "observed_rain" in df.columns and "nwp_rain_raw" in df.columns:
+            df["target_bias"] = df["observed_rain"] - df["nwp_rain_raw"]
+
     return df
 
 
@@ -764,6 +769,12 @@ def load_training_dataset(
         assert_valid_training_years(df)
         df = standardize_dataframe_columns(df, inplace=True)
 
+        # Filter out rows with NaN target_bias to guarantee clean supervised training targets
+        if "target_bias" in df.columns and df["target_bias"].isna().any():
+            n_nan = int(df["target_bias"].isna().sum())
+            logger.info("[Sparse Target Filtering] Dropping %d rows with unobserved/NaN target_bias for supervised training.", n_nan)
+            df = df.dropna(subset=["target_bias"]).reset_index(drop=True)
+
         # Multi-model dataset filtering: isolate rows matching target weather_model
         if norm_wm and ("weather_model" in df.columns or "origin" in df.columns):
             wm_col = "weather_model" if "weather_model" in df.columns else "origin"
@@ -816,6 +827,12 @@ def load_training_dataset(
                 df = df.iloc[:max_samples].reset_index(drop=True)
             assert_valid_training_years(df)
             df = standardize_dataframe_columns(df, inplace=True)
+
+            # Filter out rows with NaN target_bias to guarantee clean supervised training targets
+            if "target_bias" in df.columns and df["target_bias"].isna().any():
+                n_nan = int(df["target_bias"].isna().sum())
+                logger.info("[Sparse Target Filtering] Dropping %d rows with unobserved/NaN target_bias for supervised training.", n_nan)
+                df = df.dropna(subset=["target_bias"]).reset_index(drop=True)
 
             # Multi-model dataset filtering
             if norm_wm and ("weather_model" in df.columns or "origin" in df.columns):

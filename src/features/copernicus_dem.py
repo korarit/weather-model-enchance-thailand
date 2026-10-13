@@ -158,20 +158,78 @@ def download_all_thailand_tiles(
     return {"total": len(tiles), "available": downloaded, "ocean_or_missing": ocean_or_missing}
 
 
+# Polyline vertices representing Thailand coastline along Andaman Sea and Gulf of Thailand
+THAILAND_COASTLINE_POINTS = np.array([
+    # Andaman Coast (Ranong down to Satun)
+    [9.97, 98.62], [9.50, 98.48], [9.00, 98.35], [8.50, 98.25],
+    [8.00, 98.30], [7.88, 98.39], [7.75, 98.75], [7.50, 99.10],
+    [7.15, 99.45], [6.80, 99.80], [6.50, 100.05],
+    # Upper Gulf West (Chumphon, Prachuap, Phetchaburi, Samut Songkhram)
+    [10.50, 99.18], [11.00, 99.45], [11.50, 99.65], [11.80, 99.80],
+    [12.25, 100.00], [12.60, 100.00], [13.15, 100.02], [13.35, 100.00],
+    # Inner Gulf (Samut Sakhon, Bangkok, Samut Prakan, Chonburi)
+    [13.50, 100.25], [13.52, 100.58], [13.45, 100.95], [13.10, 100.90],
+    # Eastern Seaboard (Rayong, Chanthaburi, Trat)
+    [12.67, 101.28], [12.60, 101.65], [12.50, 102.00], [12.20, 102.30],
+    [11.90, 102.75], [11.65, 102.90],
+    # Lower Gulf (Surat Thani, Nakhon Si Thammarat, Songkhla, Pattani, Narathiwat)
+    [9.90, 99.20], [9.40, 99.25], [9.15, 99.35], [9.20, 99.75],
+    [8.85, 99.95], [8.50, 100.10], [8.00, 100.25], [7.50, 100.40],
+    [7.20, 100.60], [6.90, 101.25], [6.60, 101.65], [6.25, 102.05],
+], dtype=np.float32)
+
+
+def compute_distance_to_thailand_coast(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    """
+    Computes realistic minimum distance (km) to Thailand's coastline
+    (both Gulf of Thailand and Andaman Sea) using dense coastal points.
+    """
+    lat_arr = np.asarray(lat, dtype=np.float32)
+    lon_arr = np.asarray(lon, dtype=np.float32)
+
+    c_lat = THAILAND_COASTLINE_POINTS[:, 0]
+    c_lon = THAILAND_COASTLINE_POINTS[:, 1]
+
+    # Handle 1D arrays or scalar inputs
+    if lat_arr.ndim == 0:
+        lat_arr = lat_arr[None]
+        lon_arr = lon_arr[None]
+        squeeze = True
+    else:
+        squeeze = False
+
+    # Mean latitude for longitude scaling
+    mean_lat_rad = np.radians((lat_arr[:, None] + c_lat[None, :]) * 0.5)
+    dy = (lat_arr[:, None] - c_lat[None, :]) * 111.13
+    dx = (lon_arr[:, None] - c_lon[None, :]) * 111.13 * np.cos(mean_lat_rad)
+
+    dist_matrix = np.sqrt(dx**2 + dy**2)
+    min_dist = np.min(dist_matrix, axis=1)
+    clipped = np.clip(min_dist, 0.5, 750.0).astype(np.float32)
+    return clipped[0] if squeeze else clipped
+
+
 def compute_terrain_gradients(
     elev_grid: np.ndarray,
     res_meters: float = 30.0
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Computes slope and aspect angles from DEM elevation raster using spatial gradients.
+    Note: In GeoTIFF arrays, row index 0 is at the North, increasing southwards.
+    Therefore, d_row is the southward gradient, and true North gradient is gy_north = -d_row.
     Returns:
         (slope_deg, aspect_sin, aspect_cos)
     """
-    gy, gx = np.gradient(elev_grid, res_meters, res_meters)
-    slope_rad = np.arctan(np.sqrt(gx**2 + gy**2))
+    d_row, gx = np.gradient(elev_grid, res_meters, res_meters)
+    gy_north = -d_row
+
+    # Slope magnitude
+    slope_rad = np.arctan(np.sqrt(gx**2 + gy_north**2))
     slope_deg = np.degrees(slope_rad).astype(np.float32)
 
-    aspect_rad = (np.arctan2(-gx, gy) % (2.0 * np.pi)).astype(np.float32)
+    # Downslope aspect azimuth (clockwise from North: 0=North, 90=East, 180=South, 270=West)
+    # Downslope vector is -grad(z) = (-gx, -gy_north) = (-gx, d_row)
+    aspect_rad = (np.arctan2(-gx, -gy_north) % (2.0 * np.pi)).astype(np.float32)
     aspect_sin = np.sin(aspect_rad).astype(np.float32)
     aspect_cos = np.cos(aspect_rad).astype(np.float32)
 
@@ -180,12 +238,9 @@ def compute_terrain_gradients(
 
 def compute_geographic_proxies(lat: np.ndarray, lon: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Computes distance to coast and Coriolis parameter.
+    Computes distance to nearest coastline (km) and Coriolis parameter.
     """
-    # Approximate distance to Gulf of Thailand (12.5N, 100.5E) or Andaman Sea (lon 98.0E)
-    dist_gulf = np.sqrt(((lat - 12.5) * 111.0) ** 2 + ((lon - 100.5) * 105.0) ** 2)
-    dist_andaman = np.maximum(0.0, (lon - 98.0) * 105.0)
-    dist_coast_km = np.clip(np.minimum(dist_gulf, dist_andaman), 0.5, 750.0).astype(np.float32)
+    dist_coast_km = compute_distance_to_thailand_coast(lat, lon)
 
     # Coriolis parameter: f = 2 * Omega * sin(lat_rad)
     lat_rad = np.radians(lat)

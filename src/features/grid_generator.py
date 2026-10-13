@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 from src.config.paths import DEFAULT_GEO_DIR, DEFAULT_DEM_DIR
-from src.features.copernicus_dem import extract_copernicus_topography
+from src.features.copernicus_dem import extract_copernicus_topography, compute_geographic_proxies
 
 # Geographic Bounds of Thailand
 LAT_MIN, LAT_MAX = 5.5, 20.5
@@ -87,14 +87,8 @@ def estimate_synthetic_topography(lat: np.ndarray, lon: np.ndarray) -> Dict[str,
     aspect_sin = np.sin(aspect_rad).astype(np.float32)
     aspect_cos = np.cos(aspect_rad).astype(np.float32)
 
-    # Distance to Coast (km): approx distance from Gulf of Thailand (lat 12.5, lon 100.5) or Andaman
-    dist_gulf = np.sqrt(((lat - 12.5) * 111.0) ** 2 + ((lon - 100.5) * 105.0) ** 2)
-    dist_andaman = np.maximum(0.0, (lon - 98.0) * 105.0)
-    dist_coast_km = np.clip(np.minimum(dist_gulf, dist_andaman), 0.5, 750.0).astype(np.float32)
-
-    # Coriolis parameter: f = 2 * Omega * sin(lat_rad)
-    lat_rad = np.radians(lat)
-    coriolis = (2.0 * OMEGA_EARTH * np.sin(lat_rad)).astype(np.float32)
+    # Distance to Coast (km) and Coriolis parameter via realistic coastline geometry
+    dist_coast_km, coriolis = compute_geographic_proxies(lat, lon)
 
     return {
         "elevation_m": np.round(elev, 1),
@@ -166,8 +160,12 @@ def generate_master_grid(
     n_cells = len(x_selected)
     logger.info("Filtered Thailand land grid cells: %d cells", n_cells)
 
-    # Generate Unique Cell IDs
-    cell_ids = [f"GRID_{i+1:06d}" for i in range(n_cells)]
+    # Generate Unique Cell IDs consistent with NWP pipelines
+    cell_ids = [
+        f"G_{int(round(lat * 50))}_{int(round(lon * 50))}"
+        for lat, lon in zip(lat_selected, lon_selected)
+    ]
+    legacy_ids = [f"GRID_{i+1:06d}" for i in range(n_cells)]
 
     # Compute Topography (Copernicus DEM 30m or Synthetic Baseline)
     if dem_source == "copernicus":
@@ -185,6 +183,7 @@ def generate_master_grid(
 
     df_grid = pd.DataFrame({
         "grid_id": cell_ids,
+        "legacy_grid_id": legacy_ids,
         "centroid_lat": np.round(lat_selected, 5),
         "centroid_lon": np.round(lon_selected, 5),
         "utm_x": np.round(x_selected, 1),

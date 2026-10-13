@@ -53,6 +53,12 @@ class SpatialObservationIndexer:
         utm_x, utm_y = self.to_utm.transform(lons, lats)
         stn_df["utm_x_km"] = utm_x / 1000.0  # Convert meters to kilometers
         stn_df["utm_y_km"] = utm_y / 1000.0
+        elev_col = None
+        for c in ["elevation_m", "elevation", "altitude", "height"]:
+            if c in stn_df.columns:
+                elev_col = c
+                break
+        stn_df["elevation_m"] = pd.to_numeric(stn_df[elev_col], errors="coerce").fillna(0.0) if elev_col else 0.0
 
         self.stations_df = stn_df.reset_index(drop=True)
         self.coords_km = np.column_stack([self.stations_df["utm_x_km"], self.stations_df["utm_y_km"]])
@@ -96,15 +102,18 @@ class SpatialObservationIndexer:
         valid_offsets = offsets[valid_mask]
 
         # Station codes and observed values
-        stn_codes = self.stations_df.iloc[valid_indices]["station_code"].tolist()
+        stn_sub = self.stations_df.iloc[valid_indices]
+        stn_codes = stn_sub["station_code"].tolist()
+        stn_elevs = stn_sub["elevation_m"].to_numpy(dtype=float) if "elevation_m" in stn_sub.columns else np.zeros(len(valid_indices))
         
         rains = []
         pressures = []
         humidities = []
         keep_dists = []
         keep_offsets = []
+        keep_elevs = []
 
-        for code, d, off in zip(stn_codes, valid_dists, valid_offsets):
+        for code, d, off, el in zip(stn_codes, valid_dists, valid_offsets, stn_elevs):
             obs = station_obs_dict.get(code, {})
             r = obs.get("hourly_rain", np.nan)
             p = obs.get("pressure", np.nan)
@@ -115,12 +124,14 @@ class SpatialObservationIndexer:
             humidities.append(h)
             keep_dists.append(d)
             keep_offsets.append(off)
+            keep_elevs.append(el)
 
         rains = np.array(rains, dtype=float)
         pressures = np.array(pressures, dtype=float)
         humidities = np.array(humidities, dtype=float)
         keep_dists = np.array(keep_dists, dtype=float)
         keep_offsets = np.array(keep_offsets, dtype=float)
+        keep_elevs = np.array(keep_elevs, dtype=float)
 
         features = {}
 
@@ -183,9 +194,9 @@ class SpatialObservationIndexer:
             features["pressure_mean_20_50km"] = np.nan
             features["humidity_mean_20_50km"] = np.nan
 
-        # Atmospheric Gradients (estimated using 2D plane fit / least squares over surrounding stations)
-        p_grad_mag = self._compute_gradient_magnitude(keep_offsets, pressures)
-        h_grad_mag = self._compute_gradient_magnitude(keep_offsets, humidities)
+        # Atmospheric Gradients (estimated using elevation-decoupled plane fit over surrounding stations)
+        p_grad_mag = self._compute_gradient_magnitude(keep_offsets, pressures, keep_elevs)
+        h_grad_mag = self._compute_gradient_magnitude(keep_offsets, humidities, None)
         features["pressure_gradient_mag"] = float(p_grad_mag)
         features["humidity_gradient_mag"] = float(h_grad_mag)
 
@@ -235,10 +246,16 @@ class SpatialObservationIndexer:
         return features
 
     @staticmethod
-    def _compute_gradient_magnitude(offsets_km: np.ndarray, values: np.ndarray) -> float:
+    def _compute_gradient_magnitude(
+        offsets_km: np.ndarray,
+        values: np.ndarray,
+        elevations_m: Optional[np.ndarray] = None
+    ) -> float:
         """
-        Computes spatial gradient magnitude ||grad V|| = sqrt((dV/dx)^2 + (dV/dy)^2)
-        via 2D linear regression over surrounding observation points.
+        Computes horizontal spatial gradient magnitude ||grad_H V|| = sqrt((dV/dx)^2 + (dV/dy)^2)
+        via 2D/3D linear regression over surrounding observation points.
+        When elevations are provided (e.g. for pressure), fits V = a*x + b*y + c*z + d to
+        decouple the vertical hydrostatic lapse rate from the true horizontal synoptic gradient.
         """
         valid_idx = ~np.isnan(values)
         if np.sum(valid_idx) < 3:
@@ -248,7 +265,22 @@ class SpatialObservationIndexer:
         y = offsets_km[valid_idx, 1]
         v = values[valid_idx]
 
-        # Fit plane: V = a*x + b*y + c
+        # Check if elevations provide meaningful vertical variation
+        has_z = elevations_m is not None and len(elevations_m) == len(values)
+        if has_z:
+            z = elevations_m[valid_idx]
+            if np.nanstd(z) > 15.0 and np.sum(valid_idx) >= 4:
+                # 3D multilinear fit: V = a*x + b*y + c*(z/1000) + d
+                A = np.column_stack([x, y, z / 1000.0, np.ones(len(x))])
+                try:
+                    coeffs, _, _, _ = np.linalg.lstsq(A, v, rcond=None)
+                    dv_dx, dv_dy = coeffs[0], coeffs[1]
+                    grad_mag = np.sqrt(dv_dx ** 2 + dv_dy ** 2) * 100.0
+                    return float(np.clip(grad_mag, 0.0, 50.0))
+                except Exception:
+                    pass
+
+        # 2D plane fit fallback: V = a*x + b*y + d
         A = np.column_stack([x, y, np.ones(len(x))])
         try:
             coeffs, _, _, _ = np.linalg.lstsq(A, v, rcond=None)

@@ -33,10 +33,39 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
+def deaccumulate_precipitation(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    De-accumulates cumulative NWP precipitation (tp) across forecast lead times.
+    In ECMWF/TIGGE GRIB, tp is cumulative precipitation since forecast cycle run_time.
+    Interval precipitation is: tp_interval(t) = max(0.0, tp(t) - tp(t-1)).
+    """
+    if "tp" not in df.columns or "lead_time_hours" not in df.columns:
+        return df
+
+    group_cols = [c for c in ["origin", "run_time", "grid_id"] if c in df.columns]
+    if not group_cols:
+        group_cols = [c for c in ["lat", "lon"] if c in df.columns]
+    if not group_cols:
+        return df
+
+    sorted_df = df.sort_values(by=group_cols + ["lead_time_hours"]).copy()
+    diff = sorted_df.groupby(group_cols)["tp"].diff()
+
+    # If the series is cumulative, consecutive differences are non-negative (> 98%)
+    # If already interval-based, differences drop frequently when rain stops.
+    neg_ratio = (diff < -0.01).mean()
+    if neg_ratio < 0.02 and sorted_df["lead_time_hours"].nunique() > 1:
+        logger.info("Detected cumulative NWP tp. De-accumulating across lead times...")
+        sorted_df["tp"] = diff.fillna(sorted_df["tp"]).clip(lower=0.0)
+
+    sorted_df["tp"] = sorted_df["tp"].clip(lower=0.0, upper=300.0)
+    return sorted_df
+
+
 def normalize_nwp_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
     Standardizes units and validates meteorological sanity bounds:
-    - tp (total precipitation): mm (if in meters, * 1000)
+    - tp (total precipitation): mm (if in meters, * 1000, then de-accumulate cumulative runs)
     - sp (surface pressure): hPa (if in Pa, / 100)
     - t2m (2m temperature): Celsius (if in Kelvin, - 273.15)
     - u10, v10: m/s
@@ -44,11 +73,19 @@ def normalize_nwp_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
     clean_df = df.copy()
 
-    # Total precipitation check (if max < 1.0 and unit was meters, convert to mm)
+    # Unit conversion for Total precipitation
     if "tp" in clean_df.columns:
-        if clean_df["tp"].max() > 0 and clean_df["tp"].max() < 0.5:
+        pos_tp = clean_df.loc[clean_df["tp"] > 0, "tp"]
+        is_meters = False
+        if hasattr(df, "attrs") and df.attrs.get("tp_units") in ["m", "meter", "metre", "meters", "metres"]:
+            is_meters = True
+        elif len(pos_tp) > 0:
+            # If values are in meters, median is typically < 0.05 m (50 mm) and max < 2.0 m
+            if pos_tp.median() < 0.05 and clean_df["tp"].max() < 2.0 and pos_tp.quantile(0.95) < 0.5:
+                is_meters = True
+        if is_meters:
+            logger.info("Converting NWP tp from meters to mm (* 1000.0)")
             clean_df["tp"] = clean_df["tp"] * 1000.0
-        clean_df["tp"] = clean_df["tp"].clip(lower=0.0, upper=300.0)
 
     # Surface pressure check (if > 2000, it's Pa -> convert to hPa)
     if "sp" in clean_df.columns:
@@ -83,6 +120,9 @@ def normalize_nwp_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         "_" + (clean_df["lon"] * 50).round().astype(int).astype(str)
     )
 
+    # De-accumulate cumulative precipitation if needed
+    clean_df = deaccumulate_precipitation(clean_df)
+
     if "cape" not in clean_df.columns:
         clean_df["cape"] = 0.0
 
@@ -103,7 +143,10 @@ def process_raw_nwp_file(input_file: Path, output_base_dir: Path = DEFAULT_OUT_N
         elif input_file.suffix in (".grib", ".grib2", ".grb"):
             import xarray as xr
             ds = xr.open_dataset(input_file, engine="cfgrib")
+            tp_units = str(ds["tp"].attrs.get("units", "")).lower() if "tp" in ds else ""
             df = ds.to_dataframe().reset_index()
+            if tp_units in ["m", "meter", "metre", "meters", "metres"]:
+                df.attrs["tp_units"] = "m"
         else:
             logger.warning("Unsupported file format: %s", input_file)
             return None
